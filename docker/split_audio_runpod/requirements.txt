@@ -1,0 +1,4 @@
+requests
+soundfile
+runpod
+numpy<2

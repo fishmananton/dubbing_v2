@@ -1,0 +1,248 @@
+apt-get install python3
+apt-get update
+apt-get upgrade
+apt install python3.12-venv
+apt install npm
+sudo apt install -y nginx curl
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo apt install -y postgresql postgresql-contrib
+apt update && apt install -y ffmpeg nodejs
+sudo adduser --disabled-password --gecos "" --shell /usr/sbin/nologin dubbed
+sudo usermod -s /bin/bash dubbed
+
+
+su dubbed
+cd /home/dubbed/app
+npm install
+NEXT_PUBLIC_API_BASE_URL="/api" NEXT_PUBLIC_GOOGLE_CLIENT_ID="759404226525-2m0gadndc52k75v8vns3rcsr3o5b9d7p.apps.googleusercontent.com" npm run build
+
+
+sudo nano /etc/systemd/system/dubbed-frontend.service
+
+[Unit]
+Description=Dubbed Next.js Frontend
+After=network.target
+
+[Service]
+Type=simple
+User=dubbed
+WorkingDirectory=/home/dubbed/app/new_ui
+Environment=NODE_ENV=production
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3000
+Environment=NEXT_PUBLIC_GOOGLE_CLIENT_ID=759404226525-2m0gadndc52k75v8vns3rcsr3o5b9d7p.apps.googleusercontent.com
+Environment=NEXT_PUBLIC_API_BASE_URL="/api"
+ExecStart=/usr/bin/npm run start -- -H 127.0.0.1 -p 3000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+
+sudo systemctl daemon-reload
+sudo systemctl enable dubbed-frontend
+sudo systemctl start dubbed-frontend
+sudo systemctl status dubbed-frontend
+
+
+sudo nano /etc/nginx/sites-available/dubbed
+
+
+server {
+    listen 80;
+    server_name _;
+    client_max_body_size 2G;
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000/;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+
+sudo ln -s /etc/nginx/sites-available/dubbed /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+I added
+
+
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d yourdomain.com
+
+
+cd /home/dubbed/app
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+
+
+sudo nano /etc/systemd/system/dubbed-backend.service
+
+
+[Unit]
+Description=Dubbed FastAPI Backend
+After=network.target
+
+[Service]
+Type=simple
+User=dubbed
+Group=dubbed
+WorkingDirectory=/home/dubbed/app
+EnvironmentFile=/home/dubbed/app/.env
+ExecStart=/home/dubbed/app/.venv/bin/gunicorn -k uvicorn.workers.UvicornWorker api.app:app --bind 127.0.0.1:8000 --workers 2
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+
+sudo systemctl daemon-reload
+sudo systemctl enable dubbed-backend
+sudo systemctl start dubbed-backend
+sudo systemctl status dubbed-backend
+
+
+
+
+
+
+sudo -u postgres psql
+CREATE USER prefect WITH PASSWORD 'FeKvBBUbaQf9di@4.dBX';
+CREATE DATABASE prefect OWNER prefect;
+\c prefect
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+\q
+
+
+cd /home/dubbed/app
+source .venv/bin/activate
+pip install "prefect==3.4.12" asyncpg
+
+
+sudo nano /etc/prefect-server.env
+PREFECT_API_URL=http://127.0.0.1:4200/api
+PREFECT_SERVER_API_HOST=127.0.0.1
+PREFECT_SERVER_API_PORT=4200
+PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://prefect:FeKvBBUbaQf9di@4.dBX@127.0.0.1:5432/prefect
+
+
+sudo chmod 600 /etc/prefect-server.env
+sudo chown root:root /etc/prefect-server.env
+
+set -a
+source /etc/prefect-server.env
+set +a
+/home/dubbed/app/.venv/bin/prefect server database upgrade -y
+
+
+sudo nano /etc/systemd/system/prefect-server.service
+[Unit]
+Description=Prefect Server
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=dubbed
+Group=dubbed
+WorkingDirectory=/home/dubbed/app/
+EnvironmentFile=/etc/prefect-server.env
+ExecStart=/home/dubbed/app/.venv/bin/prefect server start --host 127.0.0.1 --port 4200
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+
+sudo systemctl daemon-reload
+sudo systemctl enable prefect-server
+sudo systemctl start prefect-server
+sudo systemctl status prefect-server
+
+prefect work-pool create video-dubbing-pool --type process
+python api/deploy.py
+
+
+
+
+
+nano /etc/systemd/system/dubbed-prefect-serve.service
+
+[Unit]
+Description=Dubbed Prefect Serve Runner
+After=network.target prefect-server.service dubbed-backend.service
+Requires=prefect-server.service
+
+[Service]
+Type=simple
+User=dubbed
+Group=dubbed
+WorkingDirectory=/home/dubbed/app
+EnvironmentFile=/etc/prefect-server.env
+ExecStart=/home/dubbed/app/.venv/bin/python /home/dubbed/app/api/serve.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+
+
+sudo systemctl daemon-reload
+sudo systemctl enable dubbed-prefect-serve
+sudo systemctl start dubbed-prefect-serve
+sudo systemctl status dubbed-prefect-serve
+
+
+nano /home/dubbed/.aws/credentials
+[myprofile]
+aws_access_key_id = YOUR_KEY
+aws_secret_access_key = YOUR_SECRET
+
+
+nano /home/dubbed/.aws/config
+[profile myprofile]
+region = us-east-1
+output = json
+
+
+chown -R dubbed:dubbed /home/dubbed/.aws
+chmod 700 /home/dubbed/.aws
+chmod 600 /home/dubbed/.aws/*
+
+
+sudo apt install sshfs
+sudo mkdir -p /mnt/storagebox
+
+sudo nano /root/.ssh/id_rsa
+(past from localhost)
+sudo chmod 600 /root/.ssh/id_rsa
+sudo nano /etc/fstab
+u589432@u589432.your-storagebox.de:/ /mnt/storagebox fuse.sshfs _netdev,IdentityFile=/root/.ssh/id_rsa,IdentitiesOnly=yes,allow_other,default_permissions,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3 0 0
+sudo mount -a
+#sudo fusermount -u /mnt/storagebox 2>/dev/null
+
+

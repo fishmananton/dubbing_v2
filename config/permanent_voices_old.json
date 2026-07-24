@@ -1,0 +1,56 @@
+{
+    "input/\u043f\u0440\u0438\u0432\u0435\u0442\u0441\u0442\u0432\u0438\u0435.mp4": {
+        "cartesia": {
+            "male": "47c38ca4-5f35-497b-b1a3-415245fb35e1",
+            "female": "2f251ac3-89a9-4a77-a452-704b474ccd01"
+        }
+    },
+    "tmp/test_video.mp4": {
+        "cartesia": {
+            "male": "47c38ca4-5f35-497b-b1a3-415245fb35e1",
+            "female": "2f251ac3-89a9-4a77-a452-704b474ccd01"
+        }
+    },
+    "output/20260327_8ker/test_video.mp4": {
+        "cartesia": {
+            "male": "47c38ca4-5f35-497b-b1a3-415245fb35e1",
+            "female": "2f251ac3-89a9-4a77-a452-704b474ccd01"
+        }
+    },
+    "output/20260327_ugfv/test_video.mp4": {
+        "cartesia": {
+            "male": "47c38ca4-5f35-497b-b1a3-415245fb35e1",
+            "female": "2f251ac3-89a9-4a77-a452-704b474ccd01"
+        }
+    },
+    "output/20260327_663t/test_video.mp4": {
+        "cartesia": {
+            "male": "47c38ca4-5f35-497b-b1a3-415245fb35e1",
+            "female": "2f251ac3-89a9-4a77-a452-704b474ccd01"
+        }
+    },
+    "output/20260328_yjmh/test_video.mp4": {
+        "cartesia": {
+            "male": "1e4176b1-3db9-44d6-a601-4fe68b041942",
+            "female": "9ed9f7e7-3ef6-4773-9dd3-ffcb479ca1f0"
+        }
+    },
+    "output/20260328_t1zc/test_video.mp4": {
+        "elevenlabs": {
+            "male": "bg9LrEYQkRYwqkxA8VOy",
+            "female": "ETBmMkYUh8i2exSl2h3P"
+        }
+    },
+    "output/good_chinese_demo/test_video.mp4": {
+        "elevenlabs": {
+            "male": "bg9LrEYQkRYwqkxA8VOy",
+            "female": "ETBmMkYUh8i2exSl2h3P"
+        }
+    },
+    "input/video_20260329_223425.mp4": {
+        "elevenlabs": {
+            "male": "XmUeU0FRyne67Dy7UaT4",
+            "female": "4Mhjd1Q9JRWcKfDQvn26"
+        }
+    }
+}

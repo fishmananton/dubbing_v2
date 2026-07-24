@@ -1,0 +1,43 @@
+front update:
+cd /home/dubbed/app/new_ui
+npm install
+NEXT_PUBLIC_API_BASE_URL="https://api.verbox.ai" NEXT_PUBLIC_GOOGLE_CLIENT_ID="759404226525-2m0gadndc52k75v8vns3rcsr3o5b9d7p.apps.googleusercontent.com" npm run build
+when i uploaded
+sudo systemctl restart dubbed-frontend
+
+
+back update:
+sudo nginx -t
+sudo systemctl reload nginx
+sudo systemctl restart dubbed-backend
+
+
+check FE logs
+sudo journalctl -u dubbed-frontend -f
+
+Check Nginx errors:
+sudo tail -f /var/log/nginx/error.log
+
+Check Nginx access:
+sudo tail -f /var/log/nginx/access.log
+
+
+Backend logs:
+sudo journalctl -u dubbed-backend -f
+
+
+
+serve logs:
+sudo journalctl -u dubbed-prefect-serve -f
+
+
+cd /home/dubbed/app/new_ui
+git pull
+npm install
+NEXT_PUBLIC_API_BASE_URL="https://api.verbox.ai" NEXT_PUBLIC_GOOGLE_CLIENT_ID="759404226525-2m0gadndc52k75v8vns3rcsr3o5b9d7p.apps.googleusercontent.com" NEXT_PUBLIC_CF_TURNSTILE_SITE_KEY="0x4AAAAAADIyzhI-Tam4Qf_K" npm run build
+sudo systemctl restart dubbed-frontend
+
+sudo nginx -t
+sudo systemctl reload nginx
+sudo systemctl restart dubbed-backend
+sudo systemctl restart dubbed-prefect-serve
