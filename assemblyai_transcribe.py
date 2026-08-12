@@ -4,41 +4,28 @@ import time
 from openai import OpenAI
 import json
 
-SYSTEM_PROMPT = """You are given subtitles with imperfect speaker diarization and imperfect subtitle segmentation.
+SYSTEM_PROMPT = """You are a subtitle quality-control editor. Your task is to fix logical errors in speaker diarization, assign descriptive role names, and flag fragmented subtitles.
 
-Tasks:
-1. Correct speaker labels.
-2. Replace generic labels with consistent English role names.
-3. Use exactly {num_speakers} speakers unless the input clearly proves fewer are present.
-4. Fix only obvious subtitle-boundary problems that break grammar, meaning, or natural speech.
+TASKS & RULES:
+1. DIARIZATION: Identify and correct logical speaker assignment errors. Do not invent a new conversation flow from scratch, but actively fix obvious flaws where the original diarization failed (including splitting a single original label if it mistakenly groups a back-and-forth conversation).
+2. ROLES: Replace generic speaker labels with consistent, descriptive English role names based on context. Target exactly {num_speakers} unique roles unless your corrections change the actual speaker count.
+3. SEGMENTATION: If a grammatical phrase is unnaturally split across adjacent subtitles by the SAME corrected speaker, set `"merge_into_next": true` on the FIRST subtitle of that split.
+4. TEXT PRESERVATION: Keep the `"text"` exactly as provided. Do NOT translate or paraphrase. Do NOT combine the text yourself when flagging a merge.
+5. Maintain exactly consistent role names throughout the entire array. Do not use synonyms for the same character.
 
-Rules:
-- Keep the same character under the same speaker name.
-- Minimize speaker names; do not invent unnecessary roles.
-- If a speaker appears for less than 5 seconds total, treat it as likely diarization noise and reassign it when context supports that.
-- Preserve the original text as much as possible.
-- Do not translate, summarize, or freely paraphrase.
-- Only adjust adjacent subtitles when needed for grammar or natural flow.
-- Only merge adjacent subtitles when they have the same corrected speaker.
-- Do not create new subtitle indices.
+OUTPUT FORMAT:
+Return a STRICT JSON object containing only the `subtitles` array.
 
-merge_into_next:
-- Set true only when this subtitle should be removed and its own text prepended to the next subtitle.
-- If merge_into_next is true, keep this subtitle's own corrected text only.
-- Do NOT repeat this subtitle's text inside the next subtitle.
-- The next subtitle should contain only its own corrected text.
-
-Return STRICT JSON ONLY.
-Return one object per input subtitle index:
-
-[
-  {
-    "index": <subtitle index>,
-    "speaker": "<speaker_name>",
-    "text": "<corrected subtitle text without speaker label>",
-    "merge_into_next": false
-  }
-]
+{
+  "subtitles": [
+    {
+      "index": 1,
+      "speaker": "Assigned Role",
+      "text": "original text strictly preserved",
+      "merge_into_next": false
+    }
+  ]
+}
 """
 
 def srt_timestamp(seconds):
@@ -47,12 +34,22 @@ def srt_timestamp(seconds):
     return f"{int(h):02}:{int(m):02}:{s:06.3f}".replace('.', ',')
 
 
-def find_speaker(time, speaker_segments):
-    """Find which speaker segment covers a given timestamp."""
+def find_speaker(start_time, end_time, speaker_segments):
+    """Find the speaker by calculating maximum overlap duration."""
+    max_overlap = 0
+    best_speaker = None
+
     for seg in speaker_segments:
-        if seg["start"] <= time <= seg["end"]:
-            return seg["speaker"]
-    return "Unknown"
+        # Calculate how much the audio segment overlaps with the diarization segment
+        overlap_start = max(start_time, seg["start"])
+        overlap_end = min(end_time, seg["end"])
+        overlap_duration = overlap_end - overlap_start
+
+        if overlap_duration > max_overlap:
+            max_overlap = overlap_duration
+            best_speaker = seg["speaker"]
+
+    return best_speaker
 
 
 def get_split_points(diar_segments, max_chunk_sec=600, pause_threshold=10):
@@ -109,9 +106,7 @@ def normalize_space(text: str) -> str:
     return " ".join((text or "").split())
 
 
-def apply_ai_segmentation_merges(segments: list[dict]) -> list[dict]:
-
-
+def apply_ai_segmentation_merges(segments: list[dict], pause_split_threshold: float = 0.4) -> list[dict]:
     if not segments:
         return []
 
@@ -124,8 +119,11 @@ def apply_ai_segmentation_merges(segments: list[dict]) -> list[dict]:
         if cur.get("merge_into_next") and i + 1 < len(segments):
             nxt = segments[i + 1].copy()
 
-            # Safety: only merge same speaker after AI correction.
-            if cur.get("speaker") == nxt.get("speaker"):
+            # Calculate the actual silence gap between the two subtitles
+            time_gap = nxt["start"] - cur["end"]
+
+            # If the gap is smaller than our intentional pause threshold, allow the heal
+            if cur.get("speaker") == nxt.get("speaker") and time_gap < pause_split_threshold:
                 nxt["start"] = cur["start"]
                 nxt["text"] = normalize_space(
                     f"{cur.get('text', '')} {nxt.get('text', '')}"
@@ -149,21 +147,23 @@ def fix_sub_diarization_with_ai(
 
     response = client.chat.completions.create(
         model=model,
-        temperature=0.0,
         messages=[
             {
-                "role": "system",
+                "role": "developer",
                 "content": SYSTEM_PROMPT.replace("{num_speakers}", f"{num_speakers}"),
             },
             {"role": "user", "content": text},
         ],
+        # temperature=0,
+        reasoning_effort="medium",
+        response_format={"type": "json_object"}
     )
 
     raw = response.choices[0].message.content.strip()
     data = json.loads(raw)
 
     fix_map = {}
-    for item in data:
+    for item in data['subtitles']:
         if not isinstance(item, dict):
             continue
 
@@ -244,8 +244,9 @@ def assemblyai_transcribe(audio_file_raw: str,  subtitles_file: str, speaker_seg
 
     data = {
         "audio_url": audio_url,
-        "speech_models" : ["universal-3-pro", "universal-2"],
-        "language_detection": True
+        "speech_models" : ["universal-3-5-pro", "universal-2"],
+        "language_detection": True,
+        "disfluencies": False
     }
     if language != "auto":
         data["language_detection"] = False
@@ -265,51 +266,96 @@ def assemblyai_transcribe(audio_file_raw: str,  subtitles_file: str, speaker_seg
         else:
             time.sleep(3)
 
-    words = transcription["words"]
-    trans_language  =transcription["language_code"].split('_')[0] if language == "auto" else language
+    trans_language = transcription.get("language_code", "ko").split('_')[0] if language == "auto" else language
 
-    # ---- 4. Build merged segments based on time + speaker
+    # Fetch AssemblyAI Native Sentences (which include internal word arrays)
+    sentences_res = requests.get(f"{base_url}/v2/transcript/{transcript_id}/sentences", headers=headers,
+                                 timeout=(10, 300))
+    sentences_res.raise_for_status()
+    sentences_data = sentences_res.json().get("sentences", [])
+
     segments = []
-    current_text = []
-    current_speaker = None
-    segment_start = None
-    prev_end = None
+    max_subtitle_duration = 7  # Max seconds a subtitle should stay on screen
+    last_known_speaker = ""
 
-    for w in words:
-            word = w["text"]
-            start = float(w["start"]/1000)
-            end = float(w["end"]/1000)
-            speaker = find_speaker((start + end) / 2, speaker_segments)  # midpoint lookup
-            if speaker == "Unknown":
-                speaker = current_speaker if current_speaker is not None else "Speaker_01"
-            # Start new segment if time gap or speaker change
-            if (prev_end and start - prev_end >= pause_split_threshold) or (speaker != current_speaker):
-                if current_text:
-                    segments.append({
-                        "speaker": current_speaker,
-                        "start": segment_start,
-                        "end": prev_end,
-                        "text": " ".join(current_text)
-                    })
-                current_text = [word]
-                segment_start = start
-                current_speaker = speaker
+    for sentence in sentences_data:
+        text = sentence.get("text", "").strip()
+        if not text:
+            continue
+
+        s_start = sentence["start"] / 1000.0
+        s_end = sentence["end"] / 1000.0
+        duration = s_end - s_start
+
+        # # 2. SENTENCE IS SHORT ENOUGH -> Keep it whole
+        # if duration <= max_subtitle_duration:
+        #     speaker = find_speaker(s_start, s_end, speaker_segments)
+        #     if speaker:
+        #         last_known_speaker = speaker
+        #     segments.append({
+        #         "speaker": last_known_speaker,
+        #         "start": s_start,
+        #         "end": s_end,
+        #         "text": text
+        #     })
+        #     continue
+
+        # 3. SENTENCE IS TOO LONG -> Split it using its internal words
+        current_text = []
+        segment_start = None
+        prev_end = None
+
+        for w in sentence.get("words", []):
+            w_text = w["text"]
+            w_start = w["start"] / 1000.0
+            w_end = w["end"] / 1000.0
+
+            # SANITIZE STRETCHED WORDS:
+            # If AssemblyAI stretches a 1-character word to 3 seconds, clamp it.
+            actual_w_duration = w_end - w_start
+            max_allowed_w_duration = max(0.6, len(w_text) * 0.25)
+            if actual_w_duration > max_allowed_w_duration:
+                w_end = w_start + max_allowed_w_duration
+
+            if not current_text:
+                segment_start = w_start
+
+            # Check split conditions inside the long sentence:
+            # - Is there a natural pause?
+            # - Have we exceeded the max duration for this chunk?
+            time_since_last_word = (w_start - prev_end) if prev_end else 0
+            current_chunk_duration = prev_end - segment_start if prev_end else 0
+
+            if prev_end and (
+                    time_since_last_word >= pause_split_threshold or current_chunk_duration >= max_subtitle_duration):
+                speaker = find_speaker(segment_start, prev_end, speaker_segments)
+                if speaker:
+                    last_known_speaker = speaker
+                segments.append({
+                    "speaker": last_known_speaker,
+                    "start": segment_start,
+                    "end": prev_end,
+                    "text": " ".join(current_text)
+                })
+                # Reset for next chunk
+                current_text = [w_text]
+                segment_start = w_start
             else:
-                if not current_text:
-                    segment_start = start
-                    current_speaker = speaker
-                current_text.append(word)
+                current_text.append(w_text)
 
-            prev_end = end
+            prev_end = w_end
 
-    # Add final segment
-    if current_text:
-        segments.append({
-            "speaker": current_speaker,
-            "start": segment_start,
-            "end": prev_end,
-            "text": " ".join(current_text)
-        })
+        # Append the final chunk of the split sentence
+        if current_text:
+            speaker = find_speaker(segment_start, prev_end, speaker_segments)
+            if speaker:
+                last_known_speaker = speaker
+            segments.append({
+                "speaker": last_known_speaker,
+                "start": segment_start,
+                "end": prev_end,
+                "text": " ".join(current_text)
+            })
 
     segments = filter_speakable_subs(segments)
 

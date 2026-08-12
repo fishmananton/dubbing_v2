@@ -5,10 +5,13 @@ import srt
 import copy
 import tempfile
 import soundfile as sf
+import torchaudio
 from runpod_utils import run_runpod_job
 from modal_utils import run_modal_job
 import os
 import threading
+
+PIPELINE_SR = 48000
 
 _silero_vad_model = None
 _silero_get_speech_timestamps = None
@@ -31,6 +34,13 @@ def get_silero_vad():
                 _silero_get_speech_timestamps = utils[0]
 
     return _silero_vad_model, _silero_get_speech_timestamps
+
+def resample_wav(path: str, target_sr: int):
+    audio, sr = torchaudio.load(path)
+    if sr != target_sr:
+        audio = torchaudio.functional.resample(audio, sr, target_sr)
+        torchaudio.save(path, audio, target_sr)
+
 
 def extract_audio(original_video: str, output_audio: str):
     subprocess.run([
@@ -116,7 +126,7 @@ def split_vocal(
     result.export(non_speech_layer_file, format="wav")
     return
 
-
+# not sure if i need exactly 16Ghz
 def prepare_vocal_asr(vocal_file: str, vocal_asr_file: str):
     cmd = [
         "ffmpeg",
@@ -124,17 +134,9 @@ def prepare_vocal_asr(vocal_file: str, vocal_asr_file: str):
         "-i", vocal_file,
         "-ac", "1",
         "-ar", "16000",
-        "-af", "loudnorm,afftdn",
         vocal_asr_file,
     ]
-
-    subprocess.run(
-        cmd,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 
     return vocal_asr_file
 
@@ -174,7 +176,7 @@ def split_audio(
     }
 
     result = run_modal_job(
-        app_name="split-audio",
+        app_name="audio-dubbing-separator",
         function_name="split_audio_job",
         timeout_minutes=30,
         poll_delay_sec=5,
@@ -201,6 +203,8 @@ def split_audio(
     if result["status"] == "COMPLETED":
         s3.download_file(bucket_name, s3_output_vocal, output_vocal)
         s3.download_file(bucket_name, s3_output_music, output_music)
+        resample_wav(output_vocal, PIPELINE_SR)
+        resample_wav(output_music, PIPELINE_SR)
         prepare_vocal_asr(output_vocal, output_vocal_asr)
 
     s3.delete_object(Bucket=bucket_name, Key=s3_input_file)
@@ -285,7 +289,15 @@ def precompute_group_voiced_durations(audio: AudioSegment, speakers: dict, subs_
 
     return precomputed
 
-def cut_speaker_audio(audio_path: str, subtitle_file: str, output_path: str, speakers: dict, min_reference_length=5.5):
+def cut_speaker_audio(
+    audio_path: str,
+    subtitle_file: str,
+    output_path: str,
+    speakers: dict,
+    emotions_tags: dict,
+    min_sec: float = 3.0,
+    max_sec: float = 8.0,
+):
     os.makedirs(output_path, exist_ok=True)
     speakers_copy = copy.deepcopy(speakers)
     audio = AudioSegment.from_file(audio_path)
@@ -295,68 +307,84 @@ def cut_speaker_audio(audio_path: str, subtitle_file: str, output_path: str, spe
 
     subs_by_index = {sub.index: sub for sub in subs}
 
-    # NEW: precompute exact voiced duration once per original speaker/emotion group
-    precomputed = precompute_group_voiced_durations(audio, speakers, subs_by_index)
+    # Build per-speaker index lists from subtitles (speaker label from content)
+    speaker_idxs: dict[str, list[int]] = {}
+    for sub in subs:
+        if ":" in sub.content:
+            spk = sub.content.split(":", 1)[0].strip()
+        else:
+            continue
+        speaker_idxs.setdefault(spk, []).append(sub.index)
 
-    for speaker_name, speaker_data in speakers.items():
-        groups = speaker_data.get("groups", {})
+    # Category priority tiers
+    PRIORITY_TIERS = [
+        {"neutral"},
+        {"happy", "sad"},
+        {"angry", "fearful", "surprised", "disgusted"},
+    ]
 
-        for emotion, group_data in groups.items():
-            # start from original group
-            collected_idxs = list(group_data.get("idxs", []))
-            estimated_total_sec = precomputed[speaker_name][emotion]["total_sec"]
+    for speaker_name in speakers.keys():
+        all_idxs = speaker_idxs.get(speaker_name, [])
+        if not all_idxs:
+            continue
 
-            # --- fallback logic using precomputed totals first ---
-            if estimated_total_sec < min_reference_length:
-                if emotion != "neutral" and "neutral" in groups:
-                    collected_idxs += precomputed[speaker_name]["neutral"]["idxs"]
-                    estimated_total_sec += precomputed[speaker_name]["neutral"]["total_sec"]
+        # Group this speaker's indices by emotion category
+        category_buckets: dict[str, list[int]] = {}
+        for idx in all_idxs:
+            tag_data = emotions_tags.get(idx) or emotions_tags.get(str(idx))
+            if tag_data and isinstance(tag_data, dict):
+                cat = tag_data.get("category", "neutral")
+            else:
+                cat = "neutral"
+            category_buckets.setdefault(cat, []).append(idx)
 
-                if estimated_total_sec < min_reference_length:
-                    for other_emotion, other_group in groups.items():
-                        if other_emotion in (emotion, "neutral"):
-                            continue
+        collected_idxs: list[int] = []
+        total_sec = 0.0
 
-                        collected_idxs += precomputed[speaker_name][other_emotion]["idxs"]
-                        estimated_total_sec += precomputed[speaker_name][other_emotion]["total_sec"]
-
-                        if estimated_total_sec >= min_reference_length:
-                            break
-
-            # dedupe + sort final idxs
-            collected_idxs = sorted(set(collected_idxs))
-
-            # IMPORTANT: do one exact recompute on the final merged set
-            # so total_sec remains faithful to your original logic
-            total_sec = get_voiced_duration_from_subs(audio, subs_by_index, collected_idxs)
-
-            speakers_copy[speaker_name]["groups"][emotion]["total_sec"] = total_sec
-
-            speaker_audio = AudioSegment.empty()
-            used_idxs=[]
-            for idx in collected_idxs:
+        for tier in PRIORITY_TIERS:
+            if total_sec >= min_sec:
+                break
+            tier_idxs = sorted(
+                idx for cat in tier for idx in category_buckets.get(cat, [])
+            )
+            for idx in tier_idxs:
                 sub = subs_by_index.get(idx)
                 if not sub:
                     continue
-
-                start_ms = int(sub.start.total_seconds() * 1000)
-                end_ms = int(sub.end.total_seconds() * 1000)
-
-                if len(speaker_audio) / 1000 > 25:
+                seg_dur = (sub.end - sub.start).total_seconds()
+                if total_sec + seg_dur > max_sec:
+                    continue
+                collected_idxs.append(idx)
+                total_sec += seg_dur
+                if total_sec >= max_sec:
                     break
 
-                if end_ms > start_ms:
-                    speaker_audio += audio[start_ms:end_ms]
-                    used_idxs.append(idx)
-            speakers_copy[speaker_name]["groups"][emotion]["used_idxs"] = used_idxs
-            if len(speaker_audio) == 0:
-                continue
+        collected_idxs.sort()
 
-            file_name = f"{speaker_name}_{emotion}.wav"
-            speaker_audio.export(
-                os.path.join(output_path, file_name),
-                format="wav"
-            )
+        # Build the audio file
+        speaker_audio = AudioSegment.empty()
+        used_idxs = []
+        for idx in collected_idxs:
+            sub = subs_by_index.get(idx)
+            if not sub:
+                continue
+            start_ms = int(sub.start.total_seconds() * 1000)
+            end_ms = int(sub.end.total_seconds() * 1000)
+            if end_ms > start_ms:
+                speaker_audio += audio[start_ms:end_ms]
+                used_idxs.append(idx)
+
+        if len(speaker_audio) == 0:
+            continue
+
+        speakers_copy[speaker_name]["reference_audio"] = f"{speaker_name}.wav"
+        speakers_copy[speaker_name]["reference_duration_sec"] = len(speaker_audio) / 1000
+        speakers_copy[speaker_name]["reference_idxs"] = used_idxs
+
+        speaker_audio.export(
+            os.path.join(output_path, f"{speaker_name}.wav"),
+            format="wav",
+        )
 
     return speakers_copy
 

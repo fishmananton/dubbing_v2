@@ -194,7 +194,7 @@ def run_line_loudness_stage(
         idx = int(sub.index)
         start = sub.start.total_seconds()
         end = sub.end.total_seconds()
-        tts_path = os.path.join(tts_segments_dir, speaker, f"{sub.index}_out.wav")
+        tts_path = os.path.join(tts_segments_dir, speaker, f"{sub.index}.wav")
         out_path = os.path.join(tts_segments_dir, speaker, f"{sub.index}_loudness_out.wav")
 
         tts_audio, tts_sr = read_wav_float(tts_path)

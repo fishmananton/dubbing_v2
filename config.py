@@ -33,7 +33,9 @@ class Configuration:
         self.general_config_file = f"{self.data_output_folder}/general_config.json"
         self.subtitles_visibility_file = f"{self.data_output_folder}/subtitles_visibility.json"
 
-        self.voice_profiles_file = f"{self.data_output_folder}/voice_profiles.pkl"
+        self.emotions_tags_file = f"{self.data_output_folder}/emotions_tags.json"
+        self.emotion_embeddings_file = f"{self.data_output_folder}/emotion_embeddings.pkl"
+        self.gemini_emotions_file = f"{self.data_output_folder}/gemini_emotions.json"
         self.vocal_file = f"{self.audio_output_folder}/vocal.wav"
         self.vocal_asr_file = f"{self.audio_output_folder}/vocal_asr.wav"
         self.music_file = f"{self.audio_output_folder}/music.wav"
@@ -64,10 +66,13 @@ class Configuration:
         self.pyannote_key = os.getenv("PYANNOTE_KEY")
 
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        self.openai_diarization_model = "gpt-5.4-mini"  # diarization.py / whisper / assemblyai / alibaba / OCR speaker repair
+        self.openai_diarization_model = "gpt-5.6-luna"  # diarization.py / whisper / assemblyai / alibaba / OCR speaker repair
         self.openai_emotion_model = "gpt-5.4-nano"      # emotion label fixes
         self.openai_timing_model = "gpt-5.4"            # timing rewrites
         self.openai_translate_model = "gpt-5.4"         # translation
+        self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+        self.anthropic_translate_pass1_model = "claude-sonnet-5"  # pass1: batch draft
+        self.anthropic_translate_pass2_model = "claude-opus-5"    # pass2: targeted reroll
 
         self.tts_model = 'tts-1-hd'
 
@@ -79,8 +84,12 @@ class Configuration:
 
 
         self.assemblyai_api_key = os.getenv("ASSEMBLYAI_API_KEY")
+        self.speechmatics_api_key = os.getenv("SPEECHMATICS_API_KEY")
         self.alibaba_api_key = os.getenv("ALIBABA_API_KEY")
         self.cartesia_api_key = os.getenv("CARTESIA_API_KEY")
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY")
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        self.deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
         self._boto_session = None
         self._openai_client = None
         self._elevenlabs_client = None

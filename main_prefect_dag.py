@@ -25,7 +25,8 @@ import pickle
 # === Import your existing functions ===
 from audio import extract_audio, split_audio, split_vocal, cut_speaker_audio, combine_audio_files
 from diarization import diarize
-from subtitles import translate
+# from subtitles import translate  # replaced by bounded translation
+from translate_bounded import translate_bounded
 from fix_timing_subs import rewrite_timing_mismatched_subtitles
 from gender import detect_gender
 from tts_v2 import tts_build_final, tts_generate_multivoice_elevenlabs_segments, tts_generate_multivoice_cartesia_segments
@@ -33,10 +34,14 @@ from video import generate_videos, cut_video, encode_preview_base
 from openvoice_module import openvoice_convert_runpod
 from subs_from_ocr import process_video_with_subs
 from emotion_detect_module import emotion_detect_runpod
+from emotion_extract_module import extract_emotions
+from gemini_emotion_extract import extract_emotions_gemini
 from detect_language import detect_language_from_chunks
 from voice_profiles import extract_voice_profiles
 from assemblyai_transcribe import assemblyai_transcribe
+from speechmatics_transcribe import speechmatics_transcribe
 from alibabacloud_transcribe import alibabacloud_transcribe
+from deepgram_transcribe import deepgram_transcribe
 from loudness_adjust import run_line_loudness_stage
 from detect_mouth_windows import detect_mouth_windows
 from test_results import qc_check
@@ -44,6 +49,7 @@ from final_audio import build_audio
 from prefect.cache_policies import NO_CACHE
 from tts_inworld import tts_generate_multivoice_inworld_segments
 from tts_fish_audio import tts_generate_multivoice_fish_segments
+from tts_index_tts2 import tts_generate_index_tts2_segments
 
 
 from whisper_transcribe import groq_whisper_large_v3_transcribe
@@ -105,6 +111,33 @@ def t_emotion_detect(config, audio_file, subtitles_file, emotions_flag, changed_
     return speakers
 
 
+@task(cache_policy=NO_CACHE)
+def t_extract_emotions(config, audio_file, subtitles_file, run_id):
+    with timer("Extract emotions (WavLM)"):
+        boto_session = config.get_boto_session()
+        embeddings = extract_emotions(
+            audio_file=audio_file,
+            subtitles_file=subtitles_file,
+            boto_session=boto_session,
+            bucket_name=config.s3_bucket_name,
+            run_id=run_id,
+        )
+    return embeddings
+
+
+@task(cache_policy=NO_CACHE)
+def t_gemini_extract_emotions(config, audio_file, subtitles_file):
+    with timer("Gemini emotion extraction"):
+        speakers = extract_emotions_gemini(
+            audio_file=audio_file,
+            subtitles_file=subtitles_file,
+            gemini_api_key=config.gemini_api_key,
+            gemini_model_name=config.gemini_model,
+            output_file=config.gemini_emotions_file,
+        )
+    return speakers
+
+
 @task
 def t_split_vocal(vocal_file,subtitles, non_speech_layer_file):
     with timer("Split Vocal"):
@@ -129,6 +162,21 @@ def t_assemblyai_transcribe(config, audio_file, speaker_segments, language, num_
             subtitles_file=config.subtitles,
             speaker_segments=speaker_segments,
             assemblyai_api_key=config.assemblyai_api_key,
+            openai_client=openai_client,
+            openai_model=config.openai_diarization_model,
+            num_speakers=num_speakers,
+            language=language)
+    return lang
+
+@task(cache_policy=NO_CACHE)
+def t_speechmatics_transcribe(config, audio_file, speaker_segments, language, num_speakers):
+    with timer("speechmatics_transcribe"):
+        openai_client = config.get_openai_client()
+        lang = speechmatics_transcribe(
+            audio_file_raw=audio_file,
+            subtitles_file=config.subtitles,
+            speaker_segments=speaker_segments,
+            speechmatics_api_key=config.speechmatics_api_key,
             openai_client=openai_client,
             openai_model=config.openai_diarization_model,
             num_speakers=num_speakers,
@@ -174,6 +222,23 @@ def t_alibabacloud_transcribe(config, audio_file, speaker_segments, language, nu
     return lang
 
 @task(cache_policy=NO_CACHE)
+def t_deepgram_transcribe(config, audio_file, speaker_segments, language, num_speakers):
+    with timer("deepgram_transcribe"):
+        openai_client = config.get_openai_client()
+
+        lang = deepgram_transcribe(
+            audio_file_raw=audio_file,
+            subtitles_file=config.subtitles,
+            speaker_segments=speaker_segments,
+            deepgram_api_key=config.deepgram_api_key,
+            openai_client=openai_client,
+            openai_model=config.openai_diarization_model,
+            num_speakers=num_speakers,
+            language=language,
+        )
+    return lang
+
+@task(cache_policy=NO_CACHE)
 def t_process_video_with_subs(config, video_file, speaker_segments, language, num_speakers, run_id):
     with timer("process_video_with_subs"):
         boto_session = config.get_boto_session()
@@ -187,12 +252,31 @@ def t_detect_gender(audio_file, subtitle_file):
         result = detect_gender(audio_file, subtitle_file)
     return result
 
+# @task(cache_policy=NO_CACHE)
+# def t_translate(config, subtitles, src_lang, translate_to_language, subtitles_translated, punctuation):
+#     with timer("translate"):
+#         openai_client = config.get_openai_client()
+#         translate(openai_client, subtitles, src_lang, translate_to_language, config.openai_translate_model, subtitles_translated, punctuation)
+#     return config.subtitles_translated_file
+
 @task(cache_policy=NO_CACHE)
 def t_translate(config, subtitles, src_lang, translate_to_language, subtitles_translated, punctuation):
-    with timer("translate"):
-        openai_client = config.get_openai_client()
-        translate(openai_client, subtitles, src_lang, translate_to_language, config.openai_translate_model, subtitles_translated, punctuation)
-    return config.subtitles_translated_file
+    with timer("translate (bounded)"):
+        result = translate_bounded(
+            anthropic_api_key=config.anthropic_api_key,
+            subtitles_file=subtitles,
+            source_language=src_lang,
+            target_language=translate_to_language,
+            pass1_model=config.anthropic_translate_pass1_model,
+            pass2_model=config.anthropic_translate_pass2_model,
+            result_file=subtitles_translated,
+        )
+        import json
+        from dataclasses import asdict
+        translation_stats_path = os.path.join(os.path.dirname(subtitles_translated), "translation_stats.json")
+        with open(translation_stats_path, "w", encoding="utf-8") as f:
+            json.dump(asdict(result), f, indent=2, ensure_ascii=False)
+    return result
 
 @task(cache_policy=NO_CACHE)
 def t_rewrite_timing_mismatched_subtitles(config, original_subtitles,translated_subtitles, fixed_translated_subtitles, visibility_res_to_fix, src_lang, translate_to_language, punctuation,num_speakers, prev_visibility_res_to_fix = None, prev_translated_subs_file = None):
@@ -218,9 +302,9 @@ def t_rewrite_timing_mismatched_subtitles(config, original_subtitles,translated_
 
 
 @task
-def t_cut_speakers(vocal_file, subtitles_file, speakers_array,speakers_folder):
+def t_cut_speakers(vocal_file, subtitles_file, speakers_array,emotions_tags, speakers_folder):
     with timer("Combine original audio"):
-        result = cut_speaker_audio(vocal_file, subtitles_file, speakers_folder, speakers_array)
+        result = cut_speaker_audio(vocal_file, subtitles_file, speakers_folder, speakers_array, emotions_tags)
     return result
 
 @task
@@ -257,6 +341,21 @@ def t_generate_fishaudio_segments(config, subtitles_file,translated_file, voice_
     with timer("generate segments"):
         fishaudio_client = config.get_fishaudio_client()
         result = tts_generate_multivoice_fish_segments(fishaudio_client, translated_file, subtitles_file, voice_audio, speakers, config.tts_segments_folder, language_code, voices, changed_list=changed_list, run_id=run_id, force_delete=force_delete, force_no_batch=force_no_batch)
+    return result
+
+
+@task(cache_policy=NO_CACHE)
+def t_generate_indextts2_segments(config, translated_file, speakers, emotions_tags, changed_list=None, max_pods=2):
+    with timer("generate index-tts2 segments"):
+        result = tts_generate_index_tts2_segments(
+            translated_subtitles_file=translated_file,
+            speakers_folder=config.speakers_folder,
+            speakers=speakers,
+            emotions_tags=emotions_tags,
+            out_dir=config.tts_segments_folder,
+            max_pods=max_pods,
+            changed_list=changed_list,
+        )
     return result
 
 
@@ -380,7 +479,8 @@ class TTS_MODEL(int, Enum):
     ELEVENLABS = 0
     INWORLD = 1
     CARTESIA = 2
-    FISHAUDIO=3
+    FISHAUDIO = 3
+    INDEXTTS2 = 4
 
 
 # === Main Flow ===
@@ -482,19 +582,19 @@ def dubbing_flow(
         if trans_type == 'ocr':
             transcribe_fut = t_process_video_with_subs.submit(config, video_file, speakers_segments, initial_language, num_speakers, run_id) # no speakers support yet
         else:
-            # transcribe_fut = t_nexara_transcribe.submit(vocal_file, speakers_segments, initial_language)
-            if initial_language=='zh':
+            if initial_language == 'zh':
                 transcribe_fut = t_alibabacloud_transcribe.submit(config, vocal_asr_file, speakers_segments, initial_language, num_speakers, run_id)
-            else: #if initial_language in ["en", "es", "fr", "de", "it", "pt", "nl", "sv", "da", "no", "fi", 'pl']:
-                transcribe_fut = t_assemblyai_transcribe.submit(config, vocal_asr_file, speakers_segments, initial_language, num_speakers)
-            # else:
-            #     transcribe_fut = t_whisper_transcribe.submit(config, vocal_asr_file, speakers_segments, initial_language,
-            #                                                  num_speakers)
+            elif initial_language in ('ja'):
+                transcribe_fut = t_deepgram_transcribe.submit(config, vocal_asr_file, speakers_segments, initial_language, num_speakers)
+            else:
+                if trans_type == 'speechmatics':
+                    transcribe_fut = t_speechmatics_transcribe.submit(config, vocal_asr_file, speakers_segments,
+                                                                  initial_language, num_speakers)
+                else:
+                    transcribe_fut = t_assemblyai_transcribe.submit(config, vocal_asr_file, speakers_segments,
+                                                                    initial_language,
+                                                                    num_speakers)
 
-
-
-            # nexara_transcribe
-            # transcribe_fut = t_multilingual_transcribe.submit(vocal_file, speakers_segments, initial_language)
         src_language = transcribe_fut.result()
         path = Path(config.general_config_file)
         data = json.loads(path.read_text()) if path.exists() else {}
@@ -502,66 +602,48 @@ def dubbing_flow(
         path.write_text(json.dumps(data, indent=4))
     else:
         src_language = json.loads(Path(config.general_config_file).read_text())["src_language"]
-
-
-
-
-
-
-
-
-
-
+    # --- TRANSLATE and EMOTION stages fire in parallel ---
     translated_fut = None
     split_vocal_fut = None
-    subtitle_visibility_analysis_fut = None
-    voice_profiles_set = None
+    gemini_emotions_fut = None
     detect_gender_fut = None
-    emotion_detect_fut=None
+
     if stage <= STAGES.TRANSLATE:
         translated_fut = t_translate.submit(config, subtitles=config.subtitles,
                                             src_lang=src_language,
                                             translate_to_language=dst_language,
                                             subtitles_translated=config.subtitles_translated_file,
                                             punctuation=punctuation)
-        subtitle_visibility_analysis_fut = t_detect_mouth_windows.submit(video_file, config.subtitles)
         split_vocal_fut = t_split_vocal.submit(vocal_file, config.subtitles, config.non_speech_layer_file)
 
-
     if stage <= STAGES.EMOTION:
-        voice_profiles_set = t_get_voice_profiles.submit( vocal_asr_file, config.subtitles)
-        emotion_detect_fut = t_emotion_detect.submit(config, vocal_file, config.subtitles, emotions_flag, changed_list, run_id)
+        gemini_emotions_fut = t_gemini_extract_emotions.submit(config, vocal_asr_file, config.subtitles)
         detect_gender_fut = t_detect_gender.submit(audio_file=vocal_asr_file,
                                                    subtitle_file=config.subtitles)
 
-
-
-    if translated_fut and split_vocal_fut:
-        translated_file = translated_fut.result()
+    # --- Align TRANSLATE results ---
+    if translated_fut:
+        translate_stats = translated_fut.result()
         copyfile(config.subtitles_translated_file, config.subtitles_fixed_translated_file)
+    if split_vocal_fut:
         split_vocal_fut.result()
-    else:
-        translated_file = config.subtitles_translated_file
+    translated_file = config.subtitles_translated_file
 
-    if voice_profiles_set and detect_gender_fut and emotion_detect_fut:
-        voice_profiles = voice_profiles_set.result()
-        detect_gender_arr = detect_gender_fut.result()
-        speakers_array = emotion_detect_fut.result()
-        for person, data in speakers_array.items():
-            if person in detect_gender_arr:
-                data.update(detect_gender_arr[person])
-        Path(config.voice_profiles_file).write_bytes(pickle.dumps(voice_profiles))
+    # --- Align EMOTION results and save to files ---
+    if gemini_emotions_fut and detect_gender_fut:
+        emotions_tags = gemini_emotions_fut.result()
+        speakers_array = detect_gender_fut.result()
+        Path(config.emotions_tags_file).write_text(json.dumps(emotions_tags, indent=4))
         Path(config.speakers_file).write_text(json.dumps(speakers_array, indent=4))
     else:
-        voice_profiles = pickle.loads(Path(config.voice_profiles_file).read_bytes())
         speakers_array = json.loads(Path(config.speakers_file).read_text())
-
+        emotions_tags = json.loads(Path(config.emotions_tags_file).read_text())
 
     if stage <= STAGES.GENERATE:
         # if len(speakers_array) <=2 and dst_language != "ru":
         #     print ("using fishaudio model because <  2 speakers")
         #     ttsmodel = TTS_MODEL.FISHAUDIO.value
-        cut_speakers_fut = t_cut_speakers.submit(vocal_file=vocal_asr_file, subtitles_file = translated_file, speakers_array=speakers_array, speakers_folder = config.speakers_folder)
+        cut_speakers_fut = t_cut_speakers.submit(vocal_file=vocal_asr_file, subtitles_file = config.subtitles, speakers_array=speakers_array, emotions_tags=emotions_tags, speakers_folder = config.speakers_folder)
         speakers_array = cut_speakers_fut.result()
         Path(config.speakers_file).write_text(json.dumps(speakers_array, indent=4))
 
@@ -608,6 +690,14 @@ def dubbing_flow(
                 force_delete=False if fix_timing else True,
                 force_no_batch=True if fix_timing or changed_list else False,
                 )
+        elif ttsmodel == TTS_MODEL.INDEXTTS2.value:
+            t_generate_segments_fut = t_generate_indextts2_segments.submit(
+                config=config,
+                translated_file=translated_file,
+                speakers=speakers_array,
+                emotions_tags=emotions_tags,
+                changed_list=changed_list,
+            )
         else:
             raise ValueError("Unknown ttsmodel {}".format(ttsmodel))
 
@@ -627,11 +717,11 @@ def dubbing_flow(
         speakers_array=json.loads(Path(config.speakers_file).read_text())
         # voices = json.loads(Path(config.general_config_file).read_text())["voices"]
 
-    if subtitle_visibility_analysis_fut:
-        subtitle_visibility_analysis = subtitle_visibility_analysis_fut.result()
-        Path(config.subtitles_visibility_file).write_text(json.dumps(subtitle_visibility_analysis))
-    else:
-        subtitle_visibility_analysis = json.loads(Path(config.subtitles_visibility_file).read_text())
+    # if subtitle_visibility_analysis_fut:
+    #     subtitle_visibility_analysis = subtitle_visibility_analysis_fut.result()
+    #     Path(config.subtitles_visibility_file).write_text(json.dumps(subtitle_visibility_analysis))
+    # else:
+    #     subtitle_visibility_analysis = json.loads(Path(config.subtitles_visibility_file).read_text())
 
     if stage <= STAGES.TEST_FIX_TIMING and fix_timing:
         tts_test_build_fut = t_tts_build_final.submit(config, speakers= speakers_array, convert_flag = True, subtitle_visibility_analysis = subtitle_visibility_analysis, testing = True)
@@ -690,6 +780,14 @@ def dubbing_flow(
                     run_id = run_id,
                     force_delete=False,
                     force_no_batch=True).result()
+            elif ttsmodel == TTS_MODEL.INDEXTTS2.value:
+                t_generate_indextts2_segments.submit(
+                    config=config,
+                    translated_file=config.subtitles_fixed_translated_file,
+                    speakers=speakers_array,
+                    emotions_tags=emotions_tags,
+                    changed_list=changed_idx,
+                ).result()
             else:
                 raise ValueError("Unknown ttsmodel {}".format(ttsmodel))
     else:
@@ -754,21 +852,31 @@ def dubbing_flow(
                     run_id = run_id,
                     force_delete=True,
                     force_no_batch=False).result()
+            elif ttsmodel == TTS_MODEL.INDEXTTS2.value:
+                t_generate_indextts2_segments.submit(
+                    config=config,
+                    translated_file=config.subtitles_fixed_translated_file,
+                    speakers=speakers_array,
+                    emotions_tags=emotions_tags,
+                    changed_list=changed_idx,
+                ).result()
             else:
                 raise ValueError("Unknown ttsmodel {}".format(ttsmodel))
     else:
         pass
-    if stage <= STAGES.CONVERT:
-        # if not fishaudio:
-            openvoice_convert_fut = t_openvoice_convert.submit(config, speakers_array, voice_profiles, changed_list=changed_list, run_id=run_id, ttsmodel = ttsmodel)
-            openvoice_convert_flag = openvoice_convert_fut.result()
-        # else:
-        #     openvoice_convert_flag = True
-    else:
-        openvoice_convert_flag = True
+    # if stage <= STAGES.CONVERT:
+    #     # if not fishaudio:
+    #         openvoice_convert_fut = t_openvoice_convert.submit(config, speakers_array, voice_profiles, changed_list=changed_list, run_id=run_id, ttsmodel = ttsmodel)
+    #         openvoice_convert_flag = openvoice_convert_fut.result()
+    #     # else:
+    #     #     openvoice_convert_flag = True
+    # else:
+    #     openvoice_convert_flag = True
     if stage <= STAGES.COMBINE:
         loudness_adjust_fut = t_loudness_adjust.submit(subtitles_file=config.subtitles_fixed_translated_file, vocal_file=config.vocal_file, tts_segments_folder = config.tts_segments_folder)
         loudness_adjust_fut.result()
+        subtitle_visibility_analysis=[]
+        openvoice_convert_flag = True
         tts_build_final_fut = t_tts_build_final.submit(config, speakers= speakers_array, convert_flag = openvoice_convert_flag, subtitle_visibility_analysis = subtitle_visibility_analysis, testing = False)
         build_audio_fut = t_build_audio.submit(config, tts_build_final_flag=tts_build_final_fut.result(),
                                             is_dubbed=is_dubbed, mix_gains=mix_gains, use_non_speech=use_non_speech)
@@ -806,17 +914,17 @@ def preconfigure():
 # # # === Entry Point ===
 if __name__ == "__main__":
     preconfigure()
-    dubbing_flow("input/output_first_4m55s.mp4",
-                 dst_language="ru",
+    dubbing_flow("input/test.mp4",
+                 dst_language="en",
                  trans_type='default',
                  emotions_flag=True,
-                 ttsmodel=TTS_MODEL.INWORLD.value,
+                 ttsmodel=TTS_MODEL.INDEXTTS2.value,
                  elevenlabs_emotions=ELEVENLABS_EMOTIONS.HIGH.value,
                  # num_speakers=1,
-                 fix_timing=True,
+                 fix_timing=False,
                  test_mode=False,
                  changed_list=[],
                  run_id='20260507_wdbk',
                  test_duration_sec=120,
                  is_dubbed=False,
-                 stage = STAGES.SPLIT.value)
+                 stage = STAGES.COMBINE.value)
