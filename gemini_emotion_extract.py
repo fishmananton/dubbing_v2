@@ -153,6 +153,7 @@ def extract_emotions_gemini(
     output_file: str,
     min_batch_sec: float = 45.0,
     max_batch_sec: float = 90.0,
+    emo_scale: float = 0.5,
 ):
     client = genai.Client(api_key=gemini_api_key)
 
@@ -186,11 +187,19 @@ def extract_emotions_gemini(
         for future in as_completed(futures):
             all_results.extend(future.result())
 
+    def _normalize_emo_vector(vec: list[float]) -> list[float]:
+        s = sum(vec)
+        if s > 0:
+            return [v / s * emo_scale for v in vec]
+        return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, emo_scale]
+
     emotions = {
         item["idx"]: {
             "emotion_tag": item.get("emotion_tag", ""),
             "category": item.get("category", "neutral"),
-            "emo_vector": item.get("emo_vector", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            "emo_vector": _normalize_emo_vector(
+                item.get("emo_vector", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            )
         }
         for item in all_results
     }

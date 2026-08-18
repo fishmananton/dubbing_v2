@@ -26,7 +26,13 @@ def diarize (boto_session: boto3.Session, pyannote_key, bucket_name: str,  audio
 
     s3 = boto_session.client("s3")
     s3_path = f"{run_id}/diarize/input/input.wav"
-    s3.upload_file(audio_path, bucket_name, s3_path)
+    audio_for_diarize = AudioSegment.from_file(audio_path).set_channels(1).set_frame_rate(16000)
+    import tempfile
+    tmp_diarize = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    audio_for_diarize.export(tmp_diarize.name, format="wav")
+    tmp_diarize.close()
+    s3.upload_file(tmp_diarize.name, bucket_name, s3_path)
+    os.unlink(tmp_diarize.name)
     input_url = s3.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket_name, "Key": s3_path},

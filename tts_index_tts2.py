@@ -1,13 +1,36 @@
 from __future__ import annotations
 
 import os
-
+import re
+import torch
 import srt
 import modal
 import torchaudio
 from pydub import AudioSegment
 
+from duration_estimator import compute_duration_factor
+
 PIPELINE_SR = 48000
+
+SILENCE_THRESHOLD = 0.01  # ~-40dB
+SILENCE_MARGIN = 0.02     # keep 20ms margin after trim
+
+
+def _trim_silence(audio: torch.Tensor, sr: int) -> torch.Tensor:
+    """Trim leading and trailing silence from audio tensor (1, N)."""
+    mono = audio[0] if audio.dim() == 2 else audio
+    abs_audio = mono.abs()
+    above = (abs_audio > SILENCE_THRESHOLD).nonzero(as_tuple=True)[0]
+    if len(above) == 0:
+        return audio
+
+    margin_samples = int(SILENCE_MARGIN * sr)
+    start = max(0, above[0].item() - margin_samples)
+    end = min(len(mono), above[-1].item() + 1 + margin_samples)
+
+    if audio.dim() == 2:
+        return audio[:, start:end]
+    return audio[start:end]
 
 
 def _write_silence(output_path: str, duration_ms: int, sample_rate: int = 48000):
@@ -29,6 +52,7 @@ def tts_generate_index_tts2_segments(
     out_dir: str,
     max_pods: int = 1,
     changed_list: list[int] | None = None,
+    duration_factors: dict[int, float] | None = None,
 ) -> dict:
     with open(translated_subtitles_file, "r", encoding="utf-8") as f:
         target_subs = list(srt.parse(f.read()))
@@ -90,15 +114,27 @@ def tts_generate_index_tts2_segments(
 
             tag_data = emotions_tags.get(idx) or emotions_tags.get(str(idx))
             if tag_data and isinstance(tag_data, dict):
-                emo_vector = tag_data.get("emo_vector", "[neutral]")
+                emo_vector = tag_data.get("emo_vector", [0.0] * 8)
             else:
-                emotion_tag = "[neutral]"
+                emo_vector = [0.0] * 8
+
+            if duration_factors and idx in duration_factors:
+                duration_factor = duration_factors[idx]
+            else:
+                duration_factor = compute_duration_factor(
+                    text=re.sub(r"[^\w\s.?!]|_", "", text),
+                    target_duration_sec=duration_sec,
+                    lang="en",
+                    emo_vector=emo_vector,
+                )
+            duration_factor =1
 
             all_items.append({
                 "speaker": speaker,
                 "idx": idx,
                 "text": text,
                 "emo_vector": emo_vector,
+                "duration_factor": duration_factor,
                 "duration_sec": duration_sec,
             })
 
@@ -140,7 +176,8 @@ def tts_generate_index_tts2_segments(
             audio, sr = torchaudio.load(out_path)
             if sr != PIPELINE_SR:
                 audio = torchaudio.functional.resample(audio, sr, PIPELINE_SR)
-                torchaudio.save(out_path, audio, PIPELINE_SR)
+            audio = _trim_silence(audio, PIPELINE_SR)
+            torchaudio.save(out_path, audio, PIPELINE_SR)
             total_generated += 1
 
     print(f"IndexTTS2: {total_generated} segments, {len(chunks)} pods")

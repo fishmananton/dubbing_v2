@@ -122,6 +122,7 @@ class IndexTTSGenerator:
                         text=sub["text"],
                         lang=lang,
                         emo_vector=sub.get("emo_vector"),
+                        duration_factor=sub.get("duration_factor", 1.0),
                         output_path=out_path,
                         use_random=False,
                     )

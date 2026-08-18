@@ -1,101 +1,56 @@
 from collections import defaultdict
+import numpy as np
+import whisper
 
-MODEL_NAME = "base"
-CONFIDENCE_THRESHOLD = 0.65
-
-def first_speech_windows_by_duration(
-    speaker_segments,
-    target_speech_sec=30.0,
-    min_seg_len=1.0,
-    max_chunk_len=15.0,
-    max_gap=0.75,   # allow small silence between speech pieces
-):
-    windows = []
-    accumulated = 0.0
-
-    segments = []
-    for seg in sorted(speaker_segments, key=lambda s: s["start"]):
-        start = float(seg["start"])
-        end = float(seg["end"])
-        if end <= start:
-            continue
-        if (end - start) < min_seg_len:
-            continue
-        segments.append((start, end))
-
-    if not segments:
-        return windows
-
-    cur_start, cur_end = segments[0]
-
-    for start, end in segments[1:]:
-        gap = start - cur_end
-        proposed_len = end - cur_start
-
-        # merge if close enough and total merged chunk not too long
-        if gap <= max_gap and proposed_len <= max_chunk_len:
-            cur_end = end
-        else:
-            windows.append((cur_start, cur_end))
-            accumulated += (cur_end - cur_start)
-            if accumulated >= target_speech_sec:
-                return windows
-            cur_start, cur_end = start, end
-
-    windows.append((cur_start, cur_end))
-    accumulated += (cur_end - cur_start)
-
-    return windows
+MODEL_NAME = "small"  # 'small' or 'turbo' is fast and accurate on 30s pure speech
 
 
-def detect_language_from_chunks(audio_path, speaker_segments):
-    import whisper
-    SR = whisper.audio.SAMPLE_RATE
-    model = whisper.load_model(MODEL_NAME)
+def detect_language_for_routing(audio_path: str, speaker_segments: list, zh_threshold: float = 0.40) -> str:
+    """
+    Stitches speech segments into a 30s pure speech buffer.
+    Returns 'zh' if Chinese is detected (for Alibaba), otherwise 'auto' (for AssemblyAI).
+    """
+    if not speaker_segments:
+        return "auto"
+
+    # 1. Load raw audio tensor
     audio = whisper.load_audio(audio_path)
+    SR = whisper.audio.SAMPLE_RATE
+    target_samples = 30 * SR  # Exactly 30 seconds of speech
 
-    windows = first_speech_windows_by_duration(
-        speaker_segments,
-        target_speech_sec=30.0,
-        min_seg_len=1.0,
-        max_chunk_len=15.0,
-    )
+    # 2. Slice and collect speech-only arrays
+    speech_chunks = []
+    accumulated_samples = 0
 
-    if not windows:
-        return "auto"
+    for seg in sorted(speaker_segments, key=lambda s: s["start"]):
+        start_idx = int(seg["start"] * SR)
+        end_idx = int(seg["end"] * SR)
 
-    aggregated = defaultdict(float)
-    used = 0
-
-    for start, end in windows:
-        chunk = audio[int(start * SR): int(end * SR)]
-
-        # Skip extremely short chunks (they become mostly silence after padding)
-        if len(chunk) < int(4.0 * SR):
+        chunk = audio[start_idx:end_idx]
+        if len(chunk) == 0:
             continue
 
-        # Whisper requires fixed-length input for detect_language
-        chunk = whisper.pad_or_trim(chunk)
+        speech_chunks.append(chunk)
+        accumulated_samples += len(chunk)
 
-        mel = whisper.log_mel_spectrogram(chunk).to(model.device)
-        _, probs = model.detect_language(mel)
+        if accumulated_samples >= target_samples:
+            break
 
-        for lang, p in probs.items():
-            aggregated[lang] += p
-
-        used += 1
-
-    if used == 0:
+    if not speech_chunks:
         return "auto"
 
-    # Average across used windows for a stable confidence number
-    for lang in aggregated:
-        aggregated[lang] /= used
+    # 3. Concatenate all speech chunks in RAM & cap at 30 seconds
+    pure_speech = np.concatenate(speech_chunks)[:target_samples]
+    pure_speech = whisper.pad_or_trim(pure_speech)
 
-    best_lang = max(aggregated, key=aggregated.get)
-    confidence = aggregated[best_lang]
+    # 4. Run single-pass Whisper language detection
+    model = whisper.load_model(MODEL_NAME)
+    mel = whisper.log_mel_spectrogram(pure_speech).to(model.device)
+    _, probs = model.detect_language(mel)
 
-    if confidence < CONFIDENCE_THRESHOLD:
-        return "auto"
+    # 5. Routing logic
+    if probs.get("zh", 0.0) >= zh_threshold:
+        return "zh"
+    initial_language = max(probs, key=probs.get)
 
-    return best_lang
+    return initial_language

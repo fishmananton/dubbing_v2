@@ -83,7 +83,7 @@ def speechmatics_transcribe(
             "config": (None, __import__("json").dumps(job_config), "application/json"),
         }
         response = requests.post(
-            f"{BASE_URL}/jobs", headers=headers, files=files, timeout=(30, 300)
+            f"{BASE_URL}/jobs", headers=headers, files=files
         )
     response.raise_for_status()
     job_id = response.json()["id"]
@@ -173,7 +173,7 @@ def speechmatics_transcribe(
                 flush_segment()
             continue
 
-        speaker = find_speaker((start + end) / 2, speaker_segments)
+        speaker = find_speaker(start,end, speaker_segments)
         if speaker == "Unknown":
             speaker = current_speaker if current_speaker is not None else "Speaker_01"
 
