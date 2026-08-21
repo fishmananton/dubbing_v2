@@ -45,28 +45,38 @@ def strip_silence(
 
 
 def adjust_speed(segment: AudioSegment, factor: float) -> AudioSegment:
-    """Adjust playback speed of a pydub.AudioSegment using ffmpeg's atempo."""
-    """Adjust playback speed of a pydub.AudioSegment using ffmpeg's atempo."""
+    """Adjust playback speed using ffmpeg atempo. Chains filters for factor > 2.0."""
     if factor <= 0:
         raise ValueError("Speed factor must be positive")
+    if abs(factor - 1.0) < 0.001:
+        return segment
 
-    # Export AudioSegment to WAV (in-memory)
+    # Build atempo filter chain (each atempo instance supports 0.5-2.0)
+    filters = []
+    remaining = factor
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    filters.append(f"atempo={remaining}")
+    filter_str = ",".join(filters)
+
     input_buffer = io.BytesIO()
     segment.export(input_buffer, format="wav")
     input_buffer.seek(0)
 
-    # Run ffmpeg with atempo filter (up to 2.0x natively supported)
     with subprocess.Popen([
         "ffmpeg", "-y",
         "-f", "wav",
         "-i", "pipe:0",
-        "-filter:a", f"atempo={factor}",
+        "-filter:a", filter_str,
         "-f", "wav",
         "pipe:1"
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
         out_data, _ = proc.communicate(input=input_buffer.read())
 
-    # Load result into new AudioSegment
     return AudioSegment.from_file(io.BytesIO(out_data), format="wav")
 
 
@@ -344,7 +354,12 @@ def tts_build_final(
         fit_ratio = raw_len / actual_available_duration
 
         # 3) if too long for actual available duration -> speed up
-        applied_speed_factor = min(max(fit_ratio, 1.0), 1.08)
+        # Short phrases (<1s) that must fit: unlimited atempo in final pass
+        must_fit_short = (subtitle_duration < 1000 and fit_ratio > 1.08)
+        if not testing and must_fit_short:
+            applied_speed_factor = max(fit_ratio, 1.0)
+        else:
+            applied_speed_factor = min(max(fit_ratio, 1.0), 1.08)
 
         if testing:
             current_len = raw_len
@@ -433,7 +448,7 @@ def tts_build_final(
             "final_fit_ratio": round(final_fit_ratio, 3),
             "spill_vs_subtitle_ms": int(spill_vs_subtitle_ms),
             "timing_status": timing_status,
-            "applied_speed_factor": min(max(fit_ratio, 1.0), 1.08),
+            "applied_speed_factor": round(applied_speed_factor, 4),
         }
         stats.append(stat)
 
@@ -522,6 +537,47 @@ def tts_build_final(
         for x in too_long if x["index"] not in existing_visibility_res_indices
     )
 
+    # ---------------- compute regen candidates ----------------
+    REGEN_OVERFLOW_THRESHOLD_MS = 2000
+    REGEN_FACTOR_FLOOR = 0.65
+
+    regen_candidates = []
+    if testing:
+        for stat in stats:
+            idx = stat["index"]
+            raw_len_ms = segment_meta[idx]["raw_len"]
+            available_ms = stat["actual_available_duration_ms"]
+            subtitle_dur_ms = stat["subtitle_duration_ms"]
+            overflow_ms = raw_len_ms - available_ms
+
+            if overflow_ms <= 0:
+                continue
+
+            # "Must fit" = would cascade into next sub
+            causes_cascade = stat["spill_vs_subtitle_ms"] > 0
+
+            # Relaxed lines: only regen if overflow > 2s
+            if not causes_cascade and overflow_ms < REGEN_OVERFLOW_THRESHOLD_MS:
+                continue
+
+            measured_factor = available_ms / raw_len_ms
+            clamped_factor = max(REGEN_FACTOR_FLOOR, measured_factor)
+
+            regen_candidates.append({
+                "idx": idx,
+                "measured_factor": round(clamped_factor, 3),
+                "raw_len_ms": raw_len_ms,
+                "available_ms": available_ms,
+                "overflow_ms": int(overflow_ms),
+                "causes_cascade": causes_cascade,
+            })
+
+    if regen_candidates:
+        print(
+            f"🔄 Regen candidates: {len(regen_candidates)} lines — "
+            + " ".join(f"#{r['idx']}(f={r['measured_factor']:.2f})" for r in regen_candidates)
+        )
+
     vis_compact = [f"#{x['idx']}:{x['change']}({x['value']:+.0f}ms)" for x in visibility_res]
     print(
         f"ℹ️ segs={len(stats)} | too_long={len(too_long)} | too_short={len(too_short)} "
@@ -536,6 +592,7 @@ def tts_build_final(
         "shifted": shifted,
         "visibility_res": visibility_res,
         "build_cache": build_cache if testing else None,
+        "regen_candidates": regen_candidates,
     }
 
 

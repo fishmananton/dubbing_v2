@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import os
-import re
 import torch
 import srt
 import modal
 import torchaudio
 from pydub import AudioSegment
 
-from duration_estimator import compute_duration_factor
 
 PIPELINE_SR = 48000
 
@@ -121,13 +119,7 @@ def tts_generate_index_tts2_segments(
             if duration_factors and idx in duration_factors:
                 duration_factor = duration_factors[idx]
             else:
-                duration_factor = compute_duration_factor(
-                    text=re.sub(r"[^\w\s.?!]|_", "", text),
-                    target_duration_sec=duration_sec,
-                    lang="en",
-                    emo_vector=emo_vector,
-                )
-            duration_factor =1
+                duration_factor = 1.0
 
             all_items.append({
                 "speaker": speaker,

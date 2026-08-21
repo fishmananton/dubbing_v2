@@ -77,7 +77,7 @@ image = (
 # ------------------------------------------------------------------------
 # 3. STATEFUL CLOUD GPU CLASS
 # ------------------------------------------------------------------------
-@app.cls(gpu="L4", image=image, scaledown_window=2)
+@app.cls(gpu="L4", image=image, scaledown_window=30)
 class IndexTTSGenerator:
 
     @modal.enter()

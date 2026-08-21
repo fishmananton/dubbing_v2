@@ -263,7 +263,6 @@ def t_detect_gender(audio_file, subtitle_file):
 @task(cache_policy=NO_CACHE)
 def t_translate(config, subtitles, src_lang, translate_to_language, subtitles_translated, punctuation, emotions_data=None, speakers_data=None):
     with timer("translate (duration-bounded)"):
-        duration_factors_file = os.path.join(os.path.dirname(subtitles_translated), "duration_factors.json")
         result = translate_duration(
             anthropic_api_key=config.anthropic_api_key,
             subtitles_file=subtitles,
@@ -272,7 +271,6 @@ def t_translate(config, subtitles, src_lang, translate_to_language, subtitles_tr
             pass1_model=config.anthropic_translate_pass1_model,
             pass2_model=config.anthropic_translate_pass2_model,
             result_file=subtitles_translated,
-            duration_factors_file=duration_factors_file,
             emotions_data=emotions_data,
             speakers_data=speakers_data,
         )
@@ -707,17 +705,13 @@ def dubbing_flow(
                 force_no_batch=True if fix_timing or changed_list else False,
                 )
         elif ttsmodel == TTS_MODEL.INDEXTTS2.value:
-            duration_factors_path = os.path.join(config.data_output_folder, "duration_factors.json")
-            duration_factors = json.loads(Path(duration_factors_path).read_text()) if Path(duration_factors_path).exists() else None
-            if duration_factors:
-                duration_factors = {int(k): v for k, v in duration_factors.items()}
             t_generate_segments_fut = t_generate_indextts2_segments.submit(
                 config=config,
                 translated_file=translated_file,
                 speakers=speakers_array,
                 emotions_tags=emotions_tags,
                 changed_list=changed_list,
-                duration_factors=duration_factors,
+                duration_factors=None,
             )
         else:
             raise ValueError("Unknown ttsmodel {}".format(ttsmodel))
@@ -879,14 +873,32 @@ def dubbing_flow(
                 raise ValueError("Unknown ttsmodel {}".format(ttsmodel))
     else:
         pass
-    # if stage <= STAGES.CONVERT:
-    #     # if not fishaudio:
-    #         openvoice_convert_fut = t_openvoice_convert.submit(config, speakers_array, voice_profiles, changed_list=changed_list, run_id=run_id, ttsmodel = ttsmodel)
-    #         openvoice_convert_flag = openvoice_convert_fut.result()
-    #     # else:
-    #     #     openvoice_convert_flag = True
-    # else:
-    #     openvoice_convert_flag = True
+
+    # ---------------- Two-pass TTS regen (IndexTTS2 only) ----------------
+    if ttsmodel == TTS_MODEL.INDEXTTS2.value and stage < STAGES.COMBINE:
+        regen_build = t_tts_build_final.submit(
+            config, speakers=speakers_array, convert_flag=True,
+            subtitle_visibility_analysis=subtitle_visibility_analysis,
+            testing=True, build_cache=build_cache, changed_list=changed_idx,
+        ).result()
+        regen_candidates = regen_build.get("regen_candidates", [])
+        build_cache = regen_build["build_cache"]
+
+        if regen_candidates:
+            regen_indices = [r["idx"] for r in regen_candidates]
+            regen_factors = {r["idx"]: r["measured_factor"] for r in regen_candidates}
+            regen_log_path = os.path.join(config.data_output_folder, "regen_factors.json")
+            with open(regen_log_path, "w", encoding="utf-8") as f:
+                json.dump(regen_candidates, f, indent=2, ensure_ascii=False)
+            t_generate_indextts2_segments.submit(
+                config=config,
+                translated_file=config.subtitles_fixed_translated_file,
+                speakers=speakers_array,
+                emotions_tags=emotions_tags,
+                changed_list=regen_indices,
+                duration_factors=regen_factors,
+            ).result()
+
     if stage <= STAGES.COMBINE:
         loudness_adjust_fut = t_loudness_adjust.submit(subtitles_file=config.subtitles_fixed_translated_file, vocal_file=config.vocal_file, tts_segments_folder = config.tts_segments_folder)
         loudness_adjust_fut.result()
