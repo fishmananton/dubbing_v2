@@ -3,6 +3,72 @@ import modal
 
 app = modal.App("index-tts-2-5-generator")
 
+SILENT_TOKEN = 52
+MAX_CONSECUTIVE_SILENCE = 2
+
+
+# ------------------------------------------------------------------------
+# 0. MONKEY-PATCH: strip mid-utterance silence from GPT codes
+# ------------------------------------------------------------------------
+def _patch_silence_removal(tts_instance):
+    """
+    Wrap semantic_codec.decode so that silence tokens (52) in GPT codes
+    are capped at MAX_CONSECUTIVE_SILENCE before decoding.
+
+    This removes the long internal pauses that IndexTTS 2.5's GPT inserts
+    around punctuation and sentence boundaries, while preserving the
+    intonation already baked into the non-silence codes.
+    """
+    import torch
+
+    original_decode = tts_instance.semantic_codec.decode
+
+    def decode_with_silence_removal(codes, *args, **kwargs):
+        # codes: [B, T] or [1, T]
+        cleaned = []
+        for i in range(codes.shape[0]):
+            code = codes[i]
+            stop_token = tts_instance.stop_mel_token
+            if torch.any(code == stop_token).item():
+                stop_idx = (code == stop_token).nonzero(as_tuple=False)[0].item()
+                active = code[:stop_idx]
+            else:
+                active = code
+
+            # Compress runs of silent_token to max MAX_CONSECUTIVE_SILENCE
+            keep_idx = []
+            consecutive = 0
+            for k in range(len(active)):
+                if active[k].item() == SILENT_TOKEN:
+                    consecutive += 1
+                    if consecutive <= MAX_CONSECUTIVE_SILENCE:
+                        keep_idx.append(k)
+                else:
+                    consecutive = 0
+                    keep_idx.append(k)
+
+            if len(keep_idx) < len(active):
+                cleaned_code = active[keep_idx]
+            else:
+                cleaned_code = active
+            cleaned.append(cleaned_code)
+
+        # Re-pad to uniform length
+        from torch.nn.utils.rnn import pad_sequence
+        max_len = max(c.shape[0] for c in cleaned)
+        padded = torch.full(
+            (len(cleaned), max_len),
+            tts_instance.stop_mel_token,
+            dtype=codes.dtype,
+            device=codes.device
+        )
+        for i, c in enumerate(cleaned):
+            padded[i, :c.shape[0]] = c
+
+        return original_decode(padded, *args, **kwargs)
+
+    tts_instance.semantic_codec.decode = decode_with_silence_removal
+
 
 # ------------------------------------------------------------------------
 # 1. DOWNLOAD & CACHE FUNCTIONS
@@ -77,7 +143,7 @@ image = (
 # ------------------------------------------------------------------------
 # 3. STATEFUL CLOUD GPU CLASS
 # ------------------------------------------------------------------------
-@app.cls(gpu="L4", image=image, scaledown_window=30)
+@app.cls(gpu="L4", image=image, scaledown_window=120)
 class IndexTTSGenerator:
 
     @modal.enter()
@@ -92,13 +158,18 @@ class IndexTTSGenerator:
             model_dir="/model_cache/indextts2_5",
             use_bf16=True,
         )
-        print("Model loaded and ready for inference.")
+        _patch_silence_removal(self.tts)
+        print("Model loaded and ready for inference (silence removal patched).")
 
     @modal.method()
     def generate(self, ref_audios: dict, subtitles: list[dict]) -> list[dict]:
         import tempfile
         import time
         import soundfile as sf
+
+        if not ref_audios and not subtitles:
+            time.sleep(5)
+            return []
 
         ref_paths = {}
         for i, (speaker, ref_bytes) in enumerate(ref_audios.items()):
@@ -125,6 +196,7 @@ class IndexTTSGenerator:
                         duration_factor=sub.get("duration_factor", 1.0),
                         output_path=out_path,
                         use_random=False,
+                        interval_silence=0,
                     )
 
                     info = sf.info(out_path)

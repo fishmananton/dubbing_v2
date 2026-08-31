@@ -197,6 +197,10 @@ def run_line_loudness_stage(
         tts_path = os.path.join(tts_segments_dir, speaker, f"{sub.index}.wav")
         out_path = os.path.join(tts_segments_dir, speaker, f"{sub.index}_loudness_out.wav")
 
+        if not os.path.exists(tts_path):
+            print(f"⚠️ Missing TTS segment {tts_path}, skipping loudness adjust")
+            continue
+
         tts_audio, tts_sr = read_wav_float(tts_path)
         if tts_sr != cfg.target_sr:
             raise ValueError(f"Unexpected TTS sample rate for {tts_path}: {tts_sr}, expected {cfg.target_sr}")

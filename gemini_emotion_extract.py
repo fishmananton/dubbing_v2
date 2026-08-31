@@ -1,6 +1,7 @@
 import json
 import io
 import os
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -129,7 +130,13 @@ def _build_context(batch_subs):
     return json.dumps(entries, ensure_ascii=False)
 
 
-def _call_gemini(client: genai.Client, model_name: str, audio_bytes: bytes, context: str):
+FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
+
+
+def _call_gemini_once(client: genai.Client, model_name: str, audio_bytes: bytes, context: str):
     response = client.models.generate_content(
         model=model_name,
         contents=[
@@ -137,12 +144,30 @@ def _call_gemini(client: genai.Client, model_name: str, audio_bytes: bytes, cont
             f"Here is the subtitle array with timestamps (in seconds) for this audio segment:\n\n{context}",
         ],
         config=genai.types.GenerateContentConfig(
-            system_instruction=GEMINI_EMOTION_PROMPT,  # Moved to system_instruction
+            system_instruction=GEMINI_EMOTION_PROMPT,
             temperature=0.1,
             response_mime_type="application/json",
         ),
     )
     return json.loads(response.text)
+
+
+def _call_gemini(client: genai.Client, model_name: str, audio_bytes: bytes, context: str, max_retries: int = 5):
+    models_to_try = [model_name] + [m for m in FALLBACK_MODELS if m != model_name]
+
+    for model in models_to_try:
+        for attempt in range(max_retries):
+            try:
+                return _call_gemini_once(client, model, audio_bytes, context)
+            except genai.errors.ServerError:
+                if attempt == max_retries - 1:
+                    break
+                wait = 2 ** attempt + 1
+                print(f"  Gemini {model} server error, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait)
+        print(f"  Gemini {model} failed after {max_retries} attempts, trying next model...")
+
+    raise RuntimeError(f"All Gemini models failed after retries: {models_to_try}")
 
 
 def extract_emotions_gemini(
@@ -153,7 +178,7 @@ def extract_emotions_gemini(
     output_file: str,
     min_batch_sec: float = 45.0,
     max_batch_sec: float = 90.0,
-    emo_scale: float = 0.5,
+    emo_scale: float = 1.0,
 ):
     client = genai.Client(api_key=gemini_api_key)
 

@@ -76,8 +76,7 @@ def mix_stems(
 
     stream_defs = [
         f"[0:a]volume={dialog_gain_db}dB,"
-        f"aecho=0.8:0.9:35|70:0.08|0.04"
-        f"pan=stereo|c0=c0|c1=c0[dlg]",
+        f"highpass=f=80,pan=stereo|c0=c0|c1=c0[dlg]",
         f"[1:a]volume={background_gain_db}dB[bg]",
     ]
     mix_inputs = ["[bg]"]
@@ -181,6 +180,23 @@ def loudnorm_pass2(
     # duck_attack: int = 15,
     # duck_release: int = 280,
 
+def measure_loudness(input_file: str) -> dict:
+    """Measure integrated loudness (LUFS) and LRA of an audio/video file.
+    Returns dict with 'i' (integrated LUFS) and 'lra' (loudness range)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_file,
+        "-af", "loudnorm=I=-16:LRA=20:TP=-1.5:print_format=json",
+        "-f", "null", "-"
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+    match = re.search(r"\{\s*\"input_i\".*?\}", proc.stderr, flags=re.S)
+    if not match:
+        return {"i": -16.0, "lra": 7.0}
+    data = json.loads(match.group(0))
+    return {"i": float(data["input_i"]), "lra": float(data["input_lra"])}
+
+
 def build_audio(
     tts_segments_folder: str,
     background_file: str,
@@ -191,13 +207,15 @@ def build_audio(
     dialog_gain_db: float = -4.0,
     non_speech_gain_db: float = -4.0,
     original_underlay_gain_db: float = -22.0,
-    duck_threshold: float = 0.08,
-    duck_ratio: float = 1.6,
-    duck_attack: int = 60,
-    duck_release: int = 500,
+    duck_threshold: float = 0.03,
+    duck_ratio: float = 6.0,
+    duck_attack: int = 15,
+    duck_release: int = 280,
     stem_background_out: str | None = None,
     stem_dialog_out: str | None = None,
     stem_original_out: str | None = None,
+    target_loudness: float | None = None,
+    target_lra: float | None = None,
 ):
     """
     Final mix pipeline:
@@ -301,10 +319,13 @@ def build_audio(
             for f in futures:
                 f.result()
 
+        loudness_target = target_loudness if target_loudness is not None else -16.0
+        lra_target = target_lra if target_lra is not None else 7.0
+
         stats = loudnorm_pass1(
             premaster_wav,
-            target_i=-16.0,
-            target_lra=7.0,
+            target_i=loudness_target,
+            target_lra=lra_target,
             target_tp=-1.5,
         )
 
@@ -312,7 +333,7 @@ def build_audio(
             premaster_wav,
             output_audio_wav,
             stats,
-            target_i=-16.0,
-            target_lra=7.0,
+            target_i=loudness_target,
+            target_lra=lra_target,
             target_tp=-1.5,
         )

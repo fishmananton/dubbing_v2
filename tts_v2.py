@@ -10,6 +10,7 @@ import soundfile as sf
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import time
+import json
 
 
 def strip_silence(
@@ -127,6 +128,9 @@ def tts_build_final(
     testing: bool = False,
     changed_list: list | None = None,
     build_cache: dict | None = None,
+    per_line_atempo: dict[int, float] | None = None,
+    speaker_base_atempo: dict[str, float] | None = None,
+    max_speed_factor: float | None = None,
 ):
 
 
@@ -230,10 +234,12 @@ def tts_build_final(
                 print(f"⚠️ Missing segment {seg_path}, inserting silence instead")
                 seg_audio = AudioSegment.silent(duration=subtitle_duration)
 
+            text = sub.content.split(":", 1)[1].strip() if ":" in sub.content else sub.content.strip()
             audio_cache[idx] = seg_audio
             segment_meta[idx] = {
                 "index": idx,
                 "speaker": speaker,
+                "text": text,
                 "seg_path": seg_path,
                 "subtitle_start_ms": subtitle_start_ms,
                 "subtitle_end_ms": subtitle_end_ms,
@@ -353,53 +359,50 @@ def tts_build_final(
         raw_subtitle_ratio = raw_len / subtitle_duration
         fit_ratio = raw_len / actual_available_duration
 
-        # 3) if too long for actual available duration -> speed up
-        # Short phrases (<1s) that must fit: unlimited atempo in final pass
-        must_fit_short = (subtitle_duration < 1000 and fit_ratio > 1.08)
-        if not testing and must_fit_short:
-            applied_speed_factor = max(fit_ratio, 1.0)
+        # 3) Speed adjustment
+        if speaker_base_atempo is not None:
+            # Dynamic speed mode: compute what's needed to fit sub_dur
+            speaker_base = speaker_base_atempo.get(speaker, 1.0)
+            needed = raw_len / subtitle_duration if subtitle_duration > 0 else 1.0
+
+            if needed <= speaker_base:
+                # Normal: clamp to [0.92, speaker_base]
+                applied_speed_factor = max(0.92, min(needed, speaker_base))
+            else:
+                # Overflow: try speaker_base first, use available room if needed
+                audio_at_base = raw_len / speaker_base
+                if audio_at_base <= actual_available_duration:
+                    applied_speed_factor = speaker_base
+                else:
+                    # Must fit in available, no cap
+                    applied_speed_factor = raw_len / actual_available_duration
+        elif per_line_atempo is not None and idx in per_line_atempo:
+            applied_speed_factor = per_line_atempo[idx]
         else:
-            applied_speed_factor = min(max(fit_ratio, 1.0), 1.08)
+            # Legacy mode
+            must_fit_short = (subtitle_duration < 1000 and fit_ratio > 1.08)
+            if not testing and must_fit_short:
+                applied_speed_factor = max(fit_ratio, 1.0)
+            else:
+                applied_speed_factor = min(max(fit_ratio, 1.0), 1.08)
+
+        if max_speed_factor is not None and applied_speed_factor > max_speed_factor:
+            applied_speed_factor = max_speed_factor
 
         if testing:
             current_len = raw_len
             if applied_speed_factor > 1.0:
                 current_len = speed_len_ms(current_len, applied_speed_factor)
+            elif applied_speed_factor < 1.0:
+                current_len = speed_len_ms(current_len, applied_speed_factor)
         else:
             working_audio = seg_audio
-            if applied_speed_factor > 1.0:
+            if applied_speed_factor != 1.0:
                 working_audio = adjust_speed(working_audio, applied_speed_factor)
             current_len = len(working_audio)
 
         current_subtitle_ratio = current_len / subtitle_duration
         current_subtitle_diff = current_len - subtitle_duration
-
-        # 4) if too short -> optional gentle slowdown
-        actual_end_ms = actual_start_ms + current_len
-        diff = subtitle_end_ms - actual_end_ms
-
-        if (
-            current_subtitle_ratio < SLOWDOWN_RATIO_THRESHOLD
-            or current_subtitle_diff < SHORT_WARN_DIFF
-            or (diff > 200 and vis["has_visible_speaking"])
-        ):
-            desired_len = subtitle_duration
-            slowdown_factor = current_len / desired_len
-            slowdown_factor = max(MAX_SLOWDOWN_FACTOR, slowdown_factor)
-
-            if slowdown_factor < 1.0:
-                if testing:
-                    slowed_len = speed_len_ms(current_len, slowdown_factor)
-                    slowed_fit_ratio = slowed_len / actual_available_duration
-                    if slowed_fit_ratio <= SOFT_LONG_RATIO_MAX:
-                        current_len = slowed_len
-                else:
-                    slowed_audio = adjust_speed(working_audio, slowdown_factor)
-                    slowed_len = len(slowed_audio)
-                    slowed_fit_ratio = slowed_len / actual_available_duration
-                    if slowed_fit_ratio <= SOFT_LONG_RATIO_MAX:
-                        working_audio = slowed_audio
-                        current_len = slowed_len
 
         # final metrics
         final_len = current_len
@@ -512,6 +515,12 @@ def tts_build_final(
 
         sf.write(final_path, final_audio, timeline_sr, format="WAV", subtype="FLOAT")
 
+        run_base = os.path.dirname(os.path.dirname(output_dir))  # output/{run_id}
+        stats_path = os.path.join(run_base, "data", "build_final_stats.json")
+        os.makedirs(os.path.dirname(stats_path), exist_ok=True)
+        with open(stats_path, "w", encoding="utf-8") as _f:
+            json.dump(stats, _f, indent=2, ensure_ascii=False)
+
     # ---------------- derive summary outputs ----------------
     too_long = [x for x in stats if x["timing_status"] == "warn_too_long"]
     too_short = [x for x in stats if x["timing_status"] == "too_short"]
@@ -537,26 +546,74 @@ def tts_build_final(
         for x in too_long if x["index"] not in existing_visibility_res_indices
     )
 
+    # ---------------- per-speaker factor analysis ----------------
+    SPEAKER_MEDIAN_THRESHOLD = 1.3
+    SPEAKER_FACTOR_FLOOR = 0.70
+    SPEAKER_FACTOR_MIN_SUB_MS = 600
+
+    speaker_to_indices: dict[str, list[int]] = {}
+    for stat in stats:
+        speaker_to_indices.setdefault(stat["speaker"], []).append(stat["index"])
+
+    speaker_factors: dict[str, float] = {}
+    if testing:
+        for speaker, indices in speaker_to_indices.items():
+            ratios = []
+            for idx in indices:
+                raw_len_ms = segment_meta[idx]["raw_len"]
+                sub_dur_ms = segment_meta[idx]["subtitle_duration_ms"]
+                if sub_dur_ms >= SPEAKER_FACTOR_MIN_SUB_MS:
+                    ratios.append(raw_len_ms / sub_dur_ms)
+            if not ratios:
+                continue
+            median_ratio = sorted(ratios)[len(ratios) // 2]
+            if median_ratio > SPEAKER_MEDIAN_THRESHOLD:
+                factor = max(SPEAKER_FACTOR_FLOOR, 1.0 / median_ratio)
+                speaker_factors[speaker] = round(factor, 3)
+
+        if speaker_factors:
+            print(
+                f"🎤 Per-speaker factors: "
+                + " ".join(f"{spk}(median→f={f})" for spk, f in speaker_factors.items())
+            )
+
     # ---------------- compute regen candidates ----------------
     REGEN_OVERFLOW_THRESHOLD_MS = 2000
-    REGEN_FACTOR_FLOOR = 0.65
+    REGEN_FACTOR_FLOOR = 0.70
 
     regen_candidates = []
     if testing:
+        # If speaker has a global factor, ALL its lines are regen candidates
+        stats_by_idx = {s["index"]: s for s in stats}
+        speaker_regen_indices = set()
+        for speaker, factor in speaker_factors.items():
+            for idx in speaker_to_indices[speaker]:
+                speaker_regen_indices.add(idx)
+                stat_entry = stats_by_idx.get(idx)
+                regen_candidates.append({
+                    "idx": idx,
+                    "measured_factor": factor,
+                    "raw_len_ms": segment_meta[idx]["raw_len"],
+                    "available_ms": stat_entry["actual_available_duration_ms"] if stat_entry else segment_meta[idx]["subtitle_duration_ms"],
+                    "overflow_ms": 0,
+                    "causes_cascade": False,
+                    "reason": "speaker_factor",
+                })
+
+        # Individual overflow lines (skip those already covered by speaker factor)
         for stat in stats:
             idx = stat["index"]
+            if idx in speaker_regen_indices:
+                continue
             raw_len_ms = segment_meta[idx]["raw_len"]
             available_ms = stat["actual_available_duration_ms"]
-            subtitle_dur_ms = stat["subtitle_duration_ms"]
             overflow_ms = raw_len_ms - available_ms
 
             if overflow_ms <= 0:
                 continue
 
-            # "Must fit" = would cascade into next sub
             causes_cascade = stat["spill_vs_subtitle_ms"] > 0
 
-            # Relaxed lines: only regen if overflow > 2s
             if not causes_cascade and overflow_ms < REGEN_OVERFLOW_THRESHOLD_MS:
                 continue
 
@@ -570,12 +627,13 @@ def tts_build_final(
                 "available_ms": available_ms,
                 "overflow_ms": int(overflow_ms),
                 "causes_cascade": causes_cascade,
+                "reason": "individual_overflow",
             })
 
     if regen_candidates:
         print(
             f"🔄 Regen candidates: {len(regen_candidates)} lines — "
-            + " ".join(f"#{r['idx']}(f={r['measured_factor']:.2f})" for r in regen_candidates)
+            + " ".join(f"#{r['idx']}(f={r['measured_factor']:.2f},{r.get('reason','?')})" for r in regen_candidates)
         )
 
     vis_compact = [f"#{x['idx']}:{x['change']}({x['value']:+.0f}ms)" for x in visibility_res]
@@ -593,6 +651,8 @@ def tts_build_final(
         "visibility_res": visibility_res,
         "build_cache": build_cache if testing else None,
         "regen_candidates": regen_candidates,
+        "speaker_factors": speaker_factors if testing else {},
+        "segment_meta": segment_meta if testing else {},
     }
 
 

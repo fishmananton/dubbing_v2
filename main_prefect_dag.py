@@ -1,12 +1,10 @@
 from __future__ import annotations
 import os
-#before 1 starting execute prefect server start
 API_URL = "http://127.0.0.1:4200/api"
 os.environ["PREFECT_API_URL"] = API_URL
 os.environ["PREFECT_LOGGING_LEVEL"] = "INFO"
 from enum import Enum
 from pathlib import Path
-import httpx
 from datetime import datetime
 import random
 import string
@@ -20,37 +18,31 @@ from config import Configuration
 from shutil import copyfile
 import shutil
 
-import pickle
 
 # === Import your existing functions ===
 from audio import extract_audio, split_audio, split_vocal, cut_speaker_audio, combine_audio_files
 from diarization import diarize
-# from subtitles import translate  # replaced by bounded translation
-from translate_bounded import translate_bounded
 from translate_duration import translate_duration
-from fix_timing_subs import rewrite_timing_mismatched_subtitles
 from gender import detect_gender
 from tts_v2 import tts_build_final, tts_generate_multivoice_elevenlabs_segments, tts_generate_multivoice_cartesia_segments
 from video import generate_videos, cut_video, encode_preview_base
-from openvoice_module import openvoice_convert_runpod
 from subs_from_ocr import process_video_with_subs
-from emotion_detect_module import emotion_detect_runpod
-from emotion_extract_module import extract_emotions
 from gemini_emotion_extract import extract_emotions_gemini
 from detect_language import detect_language_for_routing
 from voice_profiles import extract_voice_profiles
-from assemblyai_transcribe import assemblyai_transcribe
+from assemblyai_transcribe import assemblyai_transcribe, assemblyai_transcribe_raw, assemble_transcription
 from speechmatics_transcribe import speechmatics_transcribe
 from alibabacloud_transcribe import alibabacloud_transcribe
 from deepgram_transcribe import deepgram_transcribe
 from loudness_adjust import run_line_loudness_stage
 from detect_mouth_windows import detect_mouth_windows
 from test_results import qc_check
-from final_audio import build_audio
+from final_audio import build_audio, measure_loudness
 from prefect.cache_policies import NO_CACHE
 from tts_inworld import tts_generate_multivoice_inworld_segments
 from tts_fish_audio import tts_generate_multivoice_fish_segments
-from tts_index_tts2 import tts_generate_index_tts2_segments
+from tts_index_tts2 import tts_generate_index_tts2_segments, CHARS_PER_SEC_PER_GPU, TARGET_POD_SECONDS
+from natural_tts_timing import compute_speaker_base_atempo, classify_lines, build_retranslation_request, build_underflow_retranslation_request, save_natural_timing_data
 
 
 from whisper_transcribe import groq_whisper_large_v3_transcribe
@@ -86,44 +78,6 @@ def t_split_audio(config, audio_file, run_id):
         boto_session = config.get_boto_session()
         split_audio(run_id, boto_session, config.s3_bucket_name, audio_file, config.vocal_file, config.music_file, config.vocal_asr_file)
     return {"vocal_file": config.vocal_file, "music_file": config.music_file, "vocal_asr_file": config.vocal_asr_file}
-
-
-@task(cache_policy=NO_CACHE)
-def t_emotion_detect(config, audio_file, subtitles_file, emotions_flag, changed_list, run_id):
-    with timer("Emotion detect"):
-        boto_session = config.get_boto_session()
-        openai_client = config.get_openai_client()
-        if changed_list:
-            speakers_array = json.loads(Path(config.speakers_file).read_text())
-        else:
-            speakers_array = None
-        speakers = emotion_detect_runpod(openai_client=openai_client,
-                                         openai_model=config.openai_emotion_model,
-                                         audio_file=audio_file,
-                                         subtitles_file=subtitles_file,
-                                         boto_session=boto_session,
-                                         bucket_name=config.s3_bucket_name,
-                                         runpod_key=config.runpod_key,
-                                         runpod_template_id=config.runpod_emotion_detect_id,
-                                         emotions_flag=emotions_flag,
-                                         changed_list = changed_list,
-                                         old_speakers_array = speakers_array,
-                                         run_id= run_id)
-    return speakers
-
-
-@task(cache_policy=NO_CACHE)
-def t_extract_emotions(config, audio_file, subtitles_file, run_id):
-    with timer("Extract emotions (WavLM)"):
-        boto_session = config.get_boto_session()
-        embeddings = extract_emotions(
-            audio_file=audio_file,
-            subtitles_file=subtitles_file,
-            boto_session=boto_session,
-            bucket_name=config.s3_bucket_name,
-            run_id=run_id,
-        )
-    return embeddings
 
 
 @task(cache_policy=NO_CACHE)
@@ -167,6 +121,30 @@ def t_assemblyai_transcribe(config, audio_file, speaker_segments, language, num_
             openai_model=config.openai_diarization_model,
             num_speakers=num_speakers,
             language=language)
+    return lang
+
+@task(cache_policy=NO_CACHE)
+def t_assemblyai_transcribe_raw(config, audio_file):
+    with timer("assemblyai_transcribe_raw"):
+        words_data, trans_language = assemblyai_transcribe_raw(
+            audio_file_raw=audio_file,
+            assemblyai_api_key=config.assemblyai_api_key,
+        )
+    return words_data, trans_language
+
+@task(cache_policy=NO_CACHE)
+def t_assemble_transcription(config, words_data, trans_language, speaker_segments, num_speakers):
+    with timer("assemble_transcription"):
+        openai_client = config.get_openai_client()
+        lang = assemble_transcription(
+            words_data=words_data,
+            trans_language=trans_language,
+            speaker_segments=speaker_segments,
+            subtitles_file=config.subtitles,
+            openai_client=openai_client,
+            openai_model=config.openai_diarization_model,
+            num_speakers=num_speakers,
+        )
     return lang
 
 @task(cache_policy=NO_CACHE)
@@ -244,7 +222,7 @@ def t_process_video_with_subs(config, video_file, speaker_segments, language, nu
     with timer("process_video_with_subs"):
         boto_session = config.get_boto_session()
         openai_client = config.get_openai_client()
-        lang = process_video_with_subs(video_file, boto_session,openai_client, config.openai_diarization_model,  config.s3_bucket_name, config.runpod_key, config.runpod_paddleocr_id,speaker_segments, config.subtitles, language, num_speakers, run_id)
+        lang = process_video_with_subs(video_file, boto_session, openai_client, config.openai_diarization_model, config.s3_bucket_name, speaker_segments, config.subtitles, language, num_speakers, run_id)
     return lang
 
 @task
@@ -253,15 +231,8 @@ def t_detect_gender(audio_file, subtitle_file):
         result = detect_gender(audio_file, subtitle_file)
     return result
 
-# @task(cache_policy=NO_CACHE)
-# def t_translate(config, subtitles, src_lang, translate_to_language, subtitles_translated, punctuation):
-#     with timer("translate"):
-#         openai_client = config.get_openai_client()
-#         translate(openai_client, subtitles, src_lang, translate_to_language, config.openai_translate_model, subtitles_translated, punctuation)
-#     return config.subtitles_translated_file
-
 @task(cache_policy=NO_CACHE)
-def t_translate(config, subtitles, src_lang, translate_to_language, subtitles_translated, punctuation, emotions_data=None, speakers_data=None):
+def t_translate(config, subtitles, src_lang, translate_to_language, subtitles_translated, punctuation, speakers_data=None):
     with timer("translate (duration-bounded)"):
         result = translate_duration(
             anthropic_api_key=config.anthropic_api_key,
@@ -271,35 +242,14 @@ def t_translate(config, subtitles, src_lang, translate_to_language, subtitles_tr
             pass1_model=config.anthropic_translate_pass1_model,
             pass2_model=config.anthropic_translate_pass2_model,
             result_file=subtitles_translated,
-            emotions_data=emotions_data,
             speakers_data=speakers_data,
         )
-        import json
         from dataclasses import asdict
         translation_stats_path = os.path.join(os.path.dirname(subtitles_translated), "translation_stats.json")
         with open(translation_stats_path, "w", encoding="utf-8") as f:
             json.dump(asdict(result), f, indent=2, ensure_ascii=False)
     return result
 
-@task(cache_policy=NO_CACHE)
-def t_rewrite_timing_mismatched_subtitles(config, original_subtitles,translated_subtitles, fixed_translated_subtitles, visibility_res_to_fix, src_lang, translate_to_language, punctuation,num_speakers, prev_visibility_res_to_fix = None, prev_translated_subs_file = None):
-    with timer("translate"):
-        openai_client = config.get_openai_client()
-        result = rewrite_timing_mismatched_subtitles(
-            client=openai_client,
-            non_translated_subs_file = original_subtitles,
-            translated_subs_file=translated_subtitles,
-            visibility_res_to_fix=visibility_res_to_fix,
-            source_language=src_lang,
-            target_language=translate_to_language,
-            model=config.openai_timing_model,
-            result_file=fixed_translated_subtitles,
-            punctuation=punctuation,
-            context_radius=2 if num_speakers ==1 else 5,
-            prev_visibility_res_to_fix=prev_visibility_res_to_fix,
-            prev_translated_subs_file = prev_translated_subs_file,
-            editable_radius= 1 if translate_to_language != "de" else 2)
-    return result
 
 
 
@@ -347,8 +297,35 @@ def t_generate_fishaudio_segments(config, subtitles_file,translated_file, voice_
     return result
 
 
+def prewarm_indextts2(subtitles_file: str) -> tuple[list, int]:
+    """Estimate pod count from source subtitles and fire dummy .spawn() calls to boot containers."""
+    import modal
+    import srt
+
+    with open(subtitles_file, "r", encoding="utf-8") as f:
+        subs = list(srt.parse(f.read()))
+
+    total_chars = 0
+    for sub in subs:
+        text = sub.content.split(":", 1)[1].strip() if ":" in sub.content else sub.content
+        total_chars += len(text)
+
+    threshold = int(CHARS_PER_SEC_PER_GPU * TARGET_POD_SECONDS)
+    num_pods = max(1, min(20, -(-total_chars // threshold)))
+
+    IndexTTSGenerator = modal.Cls.from_name("index-tts-2-5-generator", "IndexTTSGenerator")
+    tts_service = IndexTTSGenerator()
+
+    handles = []
+    for _ in range(num_pods):
+        handles.append(tts_service.generate.spawn({}, []))
+
+    print(f"Pre-warm: fired {num_pods} dummy containers (from {total_chars} source chars)")
+    return handles, num_pods
+
+
 @task(cache_policy=NO_CACHE)
-def t_generate_indextts2_segments(config, translated_file, speakers, emotions_tags, changed_list=None, max_pods=2, duration_factors=None):
+def t_generate_indextts2_segments(config, translated_file, speakers, emotions_tags, changed_list=None, max_pods=20, duration_factors=None, candidate_texts=None, speaker_base_atempo=None, warm_pods=0):
     with timer("generate index-tts2 segments"):
         result = tts_generate_index_tts2_segments(
             translated_subtitles_file=translated_file,
@@ -359,6 +336,9 @@ def t_generate_indextts2_segments(config, translated_file, speakers, emotions_ta
             max_pods=max_pods,
             changed_list=changed_list,
             duration_factors=duration_factors,
+            candidate_texts=candidate_texts,
+            speaker_base_atempo=speaker_base_atempo,
+            warm_pods=warm_pods,
         )
     return result
 
@@ -370,32 +350,12 @@ def t_combine_tts_segments(speakers, tts_segments_folder):
     return tts_segments_folder
 
 
-@task(cache_policy=NO_CACHE)
-def t_openvoice_convert(config, speakers,voice_profiles,changed_list:list| None =None,run_id:str='', ttsmodel:int = 0):
-    with timer("openvoice convert"):
-        boto_session = config.get_boto_session()
-
-        openvoice_convert_runpod(speakers=speakers,
-                                 voice_profile=voice_profiles,
-                                 temp_output_folder=config.temp_output_folder,
-                                 reference_speakers_folder=config.speakers_folder,
-                                 base_speaker_folder=config.tts_segments_folder,
-                                 input_files_folder=config.tts_segments_folder,
-                                 output_files_folder=config.tts_segments_folder,
-                                 boto_session=boto_session,
-                                 bucket_name=config.s3_bucket_name,
-                                 runpod_key=config.runpod_key,
-                                 runpod_template_id=config.runpod_openvoice_id,
-                                 changed_list=changed_list,
-                                 run_id=run_id,
-                                 ttsmodel=ttsmodel)
-        shutil.rmtree(config.temp_output_folder, ignore_errors=True)
-    return True
 
 @task(cache_policy=NO_CACHE)
-def t_tts_build_final(config, speakers, convert_flag, subtitle_visibility_analysis, testing = False, build_cache=None, changed_list=None):
+def t_tts_build_final(config, speakers, convert_flag, subtitle_visibility_analysis, testing = False, build_cache=None, changed_list=None, per_line_atempo=None, subtitles_file=None, speaker_base_atempo=None, max_speed_factor=None):
     with timer("Build Final TTS"):
-        result = tts_build_final(speakers, config.subtitles_translated_file, config.tts_segments_folder, config.tts_segments_folder, subtitle_visibility_analysis, testing, changed_list=changed_list, build_cache=build_cache)
+        subs_file = subtitles_file or config.subtitles_translated_file
+        result = tts_build_final(speakers, subs_file, config.tts_segments_folder, config.tts_segments_folder, subtitle_visibility_analysis, testing, changed_list=changed_list, build_cache=build_cache, per_line_atempo=per_line_atempo, speaker_base_atempo=speaker_base_atempo, max_speed_factor=max_speed_factor)
     return result
 
 @task
@@ -406,7 +366,7 @@ def t_get_voice_profiles(audio_file, subtitles_file):
 
 
 @task(cache_policy=NO_CACHE)
-def t_build_audio(config, tts_build_final_flag, is_dubbed=False, mix_gains: list[float] | None = None, use_non_speech: bool = True):
+def t_build_audio(config, tts_build_final_flag, is_dubbed=False, mix_gains: list[float] | None = None, use_non_speech: bool = True, video_file: str | None = None):
     # mix_gains = [background_db, dialog_db, non_speech_db, original_underlay_db]
     gain_kwargs = {}
     if mix_gains and len(mix_gains) == 4:
@@ -416,6 +376,13 @@ def t_build_audio(config, tts_build_final_flag, is_dubbed=False, mix_gains: list
             "non_speech_gain_db": mix_gains[2],
             "original_underlay_gain_db": mix_gains[3],
         }
+
+    # Match original video loudness and dynamic range
+    if video_file:
+        original_stats = measure_loudness(video_file)
+        gain_kwargs.setdefault("target_loudness", original_stats["i"])
+        gain_kwargs.setdefault("target_lra", original_stats["lra"])
+
     with timer("Bild Final Audio"):
         build_audio(
             tts_segments_folder=config.tts_segments_folder,
@@ -434,7 +401,7 @@ def t_build_audio(config, tts_build_final_flag, is_dubbed=False, mix_gains: list
 def t_generate_videos(config, video_file, audio_result_file, preview=True):
     with timer("Bild Final Video"):
         output_file = config.final_video_preview_file if preview else config.final_video_file
-        generate_videos(video_file, audio_result_file, config.subtitles_translated_file, output_file, preview=preview,
+        generate_videos(video_file, audio_result_file, config.subtitles_retranslated_file, output_file, preview=preview,
                         pre_encoded_video=config.preview_base_video_file if preview else None)
     return output_file
 
@@ -468,10 +435,8 @@ class STAGES(int, Enum):
     EMOTION = 3
     TRANSLATE = 4
     GENERATE = 5
-    TEST_FIX_TIMING = 6
-    TEST_FIX_TIMING_2 = 7
-    CONVERT = 8
-    COMBINE = 9
+    TIMING_FIX = 6
+    COMBINE = 7
 
 class ELEVENLABS_EMOTIONS(int, Enum):
     LOW = 0
@@ -497,7 +462,6 @@ def dubbing_flow(
         num_speakers=None,
         emotions_flag:bool=True,
         elevenlabs_emotions:int = ELEVENLABS_EMOTIONS.MEDIUM.value,
-        fix_timing:bool=True,
         changed_list:list| None=None,
         is_dubbed: bool = False,
         test_mode: bool = False,
@@ -534,14 +498,12 @@ def dubbing_flow(
         "elevenlabs_emotions": elevenlabs_emotions,
         "num_speakers": num_speakers,
         "emotions_flag": emotions_flag,
-        "fix_timing": fix_timing,
         "test_mode": test_mode,
         "is_dubbed": is_dubbed,
         "test_duration_sec": test_duration_sec,
         "use_non_speech": use_non_speech,
         "output_file": None
     }
-    # data["start_time"] = datetime.now().isoformat()
     path.write_text(json.dumps(data, indent=4))
 
     punctuation = False if dst_language != 'ru' else True # For Yandex it should go with punctuation
@@ -569,70 +531,94 @@ def dubbing_flow(
             video_file = config.test_video_file
 
     if stage <= STAGES.DIARIZE:
+        # Detect language early using Silero VAD (no diarization needed)
+        initial_language_fut = t_detect_language.submit(config, None, vocal_asr_file)
+        # Start diarization in parallel
         diar_fut = t_diarize.submit(config, audio_file, num_speakers, run_id)
-        speakers_segments = diar_fut.result()
-        Path(config.speakers_segments_file).write_text(json.dumps(speakers_segments, indent=4))
-        initial_language_fut = t_detect_language.submit(config, speakers_segments)
+
         initial_language = initial_language_fut.result()
         path = Path(config.general_config_file)
         data = json.loads(path.read_text()) if path.exists() else {}
         data["initial_src_language"] = initial_language
         path.write_text(json.dumps(data, indent=4))
     else:
+        diar_fut = None
         speakers_segments = json.loads(Path(config.speakers_segments_file).read_text())
         initial_language = json.loads(Path(config.general_config_file).read_text())["initial_src_language"]
 
     if stage <= STAGES.TRANSCRIBE:
         if trans_type == 'ocr':
-            transcribe_fut = t_process_video_with_subs.submit(config, video_file, speakers_segments, initial_language, num_speakers, run_id) # no speakers support yet
+            # OCR path needs diarization first
+            if diar_fut is not None:
+                speakers_segments = diar_fut.result()
+                Path(config.speakers_segments_file).write_text(json.dumps(speakers_segments, indent=4))
+            transcribe_fut = t_process_video_with_subs.submit(config, video_file, speakers_segments, initial_language, num_speakers, run_id)
+            src_language = transcribe_fut.result()
+        elif initial_language == 'zh':
+            if diar_fut is not None:
+                speakers_segments = diar_fut.result()
+                Path(config.speakers_segments_file).write_text(json.dumps(speakers_segments, indent=4))
+            transcribe_fut = t_alibabacloud_transcribe.submit(config, vocal_asr_file, speakers_segments, initial_language, num_speakers, run_id)
+            src_language = transcribe_fut.result()
+        elif initial_language in ('ja'):
+            if diar_fut is not None:
+                speakers_segments = diar_fut.result()
+                Path(config.speakers_segments_file).write_text(json.dumps(speakers_segments, indent=4))
+            transcribe_fut = t_deepgram_transcribe.submit(config, vocal_asr_file, speakers_segments, initial_language, num_speakers)
+            src_language = transcribe_fut.result()
+        elif trans_type == 'speechmatics':
+            if diar_fut is not None:
+                speakers_segments = diar_fut.result()
+                Path(config.speakers_segments_file).write_text(json.dumps(speakers_segments, indent=4))
+            transcribe_fut = t_speechmatics_transcribe.submit(config, audio_file, speakers_segments, initial_language, num_speakers)
+            src_language = transcribe_fut.result()
         else:
-            if initial_language == 'zh':
-                transcribe_fut = t_alibabacloud_transcribe.submit(config, vocal_asr_file, speakers_segments, initial_language, num_speakers, run_id)
-            elif initial_language in ('ja'):
-                transcribe_fut = t_deepgram_transcribe.submit(config, vocal_asr_file, speakers_segments, initial_language, num_speakers)
-            else:
-                if trans_type == 'speechmatics':
-                    transcribe_fut = t_speechmatics_transcribe.submit(config, audio_file, speakers_segments,
-                                                                  initial_language, num_speakers)
-                else:
-                    transcribe_fut = t_assemblyai_transcribe.submit(config, audio_file, speakers_segments,
-                                                                    initial_language,
-                                                                    num_speakers)
+            # AssemblyAI: fire raw transcription in parallel with diarization
+            raw_fut = t_assemblyai_transcribe_raw.submit(config, vocal_file)
 
-        src_language = transcribe_fut.result()
+            # Wait for both
+            if diar_fut is not None:
+                speakers_segments = diar_fut.result()
+                Path(config.speakers_segments_file).write_text(json.dumps(speakers_segments, indent=4))
+            words_data, trans_language = raw_fut.result()
+
+            # Assemble with both results
+            src_language = t_assemble_transcription.submit(
+                config, words_data, trans_language, speakers_segments, num_speakers
+            ).result()
+
         path = Path(config.general_config_file)
         data = json.loads(path.read_text()) if path.exists() else {}
         data["src_language"] = src_language
         path.write_text(json.dumps(data, indent=4))
     else:
+        if diar_fut is not None:
+            speakers_segments = diar_fut.result()
+            Path(config.speakers_segments_file).write_text(json.dumps(speakers_segments, indent=4))
         src_language = json.loads(Path(config.general_config_file).read_text())["src_language"]
     # --- EMOTION stage (must complete before TRANSLATE for duration estimation) ---
     gemini_emotions_fut = None
     detect_gender_fut = None
     mouth_windows_fut = None
+    prewarm_handles = None
+    prewarm_pods = 0
 
     if stage <= STAGES.EMOTION:
         gemini_emotions_fut = t_gemini_extract_emotions.submit(config, vocal_asr_file, config.subtitles)
         detect_gender_fut = t_detect_gender.submit(audio_file=vocal_asr_file,
                                                    subtitle_file=config.subtitles)
         mouth_windows_fut = t_detect_mouth_windows.submit(video_file, config.subtitles)
+        if ttsmodel == TTS_MODEL.INDEXTTS2.value:
+            prewarm_handles, prewarm_pods = prewarm_indextts2(config.subtitles)
 
-    if gemini_emotions_fut and detect_gender_fut:
-        emotions_tags = gemini_emotions_fut.result()
+    # Resolve detect_gender early so translate can start in parallel with Gemini
+    if detect_gender_fut:
         speakers_array = detect_gender_fut.result()
-        Path(config.emotions_tags_file).write_text(json.dumps(emotions_tags, indent=4))
         Path(config.speakers_file).write_text(json.dumps(speakers_array, indent=4))
     else:
         speakers_array = json.loads(Path(config.speakers_file).read_text())
-        emotions_tags = json.loads(Path(config.emotions_tags_file).read_text())
 
-    if mouth_windows_fut:
-        subtitle_visibility_analysis = mouth_windows_fut.result()
-        Path(config.subtitles_visibility_file).write_text(json.dumps(subtitle_visibility_analysis))
-    else:
-        subtitle_visibility_analysis = json.loads(Path(config.subtitles_visibility_file).read_text())
-
-    # --- TRANSLATE stage (uses emotion vectors for duration scoring) ---
+    # --- TRANSLATE stage (runs in parallel with Gemini emotions + mouth detection) ---
     translated_fut = None
     split_vocal_fut = None
 
@@ -642,24 +628,37 @@ def dubbing_flow(
                                             translate_to_language=dst_language,
                                             subtitles_translated=config.subtitles_translated_file,
                                             punctuation=punctuation,
-                                            emotions_data=emotions_tags,
                                             speakers_data=speakers_array)
         split_vocal_fut = t_split_vocal.submit(vocal_file, config.subtitles, config.non_speech_layer_file)
 
+    # Now wait for Gemini emotions (which has been running in parallel with translate)
+    if gemini_emotions_fut:
+        emotions_tags = gemini_emotions_fut.result()
+        Path(config.emotions_tags_file).write_text(json.dumps(emotions_tags, indent=4))
+    else:
+        emotions_tags = json.loads(Path(config.emotions_tags_file).read_text())
+
+    if mouth_windows_fut:
+        subtitle_visibility_analysis = mouth_windows_fut.result()
+        Path(config.subtitles_visibility_file).write_text(json.dumps(subtitle_visibility_analysis))
+    else:
+        subtitle_visibility_analysis = json.loads(Path(config.subtitles_visibility_file).read_text())
+
     if translated_fut:
         translate_stats = translated_fut.result()
-        copyfile(config.subtitles_translated_file, config.subtitles_fixed_translated_file)
     if split_vocal_fut:
         split_vocal_fut.result()
     translated_file = config.subtitles_translated_file
 
     if stage <= STAGES.GENERATE:
-        # if len(speakers_array) <=2 and dst_language != "ru":
-        #     print ("using fishaudio model because <  2 speakers")
-        #     ttsmodel = TTS_MODEL.FISHAUDIO.value
         cut_speakers_fut = t_cut_speakers.submit(vocal_file=vocal_asr_file, subtitles_file = config.subtitles, speakers_array=speakers_array, emotions_tags=emotions_tags, speakers_folder = config.speakers_folder)
         speakers_array = cut_speakers_fut.result()
         Path(config.speakers_file).write_text(json.dumps(speakers_array, indent=4))
+
+        if prewarm_handles:
+            with timer("Wait for pre-warm containers"):
+                for h in prewarm_handles:
+                    h.get()
 
         if ttsmodel == TTS_MODEL.ELEVENLABS.value:
             t_generate_segments_fut = t_generate_elevenlab_segments.submit(
@@ -701,8 +700,8 @@ def dubbing_flow(
                 language_code=dst_language,
                 changed_list=changed_list,
                 run_id = run_id,
-                force_delete=False if fix_timing else True,
-                force_no_batch=True if fix_timing or changed_list else False,
+                force_delete=True,
+                force_no_batch=True if changed_list else False,
                 )
         elif ttsmodel == TTS_MODEL.INDEXTTS2.value:
             t_generate_segments_fut = t_generate_indextts2_segments.submit(
@@ -712,6 +711,7 @@ def dubbing_flow(
                 emotions_tags=emotions_tags,
                 changed_list=changed_list,
                 duration_factors=None,
+                warm_pods=prewarm_pods,
             )
         else:
             raise ValueError("Unknown ttsmodel {}".format(ttsmodel))
@@ -728,193 +728,162 @@ def dubbing_flow(
         Path(config.permanent_voices_file).write_text(json.dumps(all_voices, indent=4))
         combine_tts_segments_res = t_combine_tts_segments.submit(speakers_array, config.tts_segments_folder)
         combine_tts_segments_res.result()
+
+        # Track how many pods the first TTS used — retranslation can reuse them as warm
+        if ttsmodel == TTS_MODEL.INDEXTTS2.value:
+            import srt as _srt
+            with open(translated_file, "r", encoding="utf-8") as _f:
+                _tgt_subs = list(_srt.parse(_f.read()))
+            _tgt_chars = sum(
+                len(s.content.split(":", 1)[1].strip()) if ":" in s.content else len(s.content)
+                for s in _tgt_subs
+            )
+            _threshold = int(CHARS_PER_SEC_PER_GPU * TARGET_POD_SECONDS)
+            first_tts_pods = max(1, min(20, -(-_tgt_chars // _threshold)))
+        else:
+            first_tts_pods = 0
     else:
         speakers_array=json.loads(Path(config.speakers_file).read_text())
         # voices = json.loads(Path(config.general_config_file).read_text())["voices"]
+        first_tts_pods = 0
 
-    if stage <= STAGES.TEST_FIX_TIMING and fix_timing:
-        tts_test_build_fut = t_tts_build_final.submit(config, speakers= speakers_array, convert_flag = True, subtitle_visibility_analysis = subtitle_visibility_analysis, testing = True)
-        tts_test_build = tts_test_build_fut.result()
-        build_cache = tts_test_build["build_cache"]
-        visibility_res_to_fix = tts_test_build['visibility_res']
-        changed_idx_fut = t_rewrite_timing_mismatched_subtitles.submit(
-            config,
-            original_subtitles = config.subtitles,
-            translated_subtitles  =config.subtitles_translated_file,
-            fixed_translated_subtitles = config.subtitles_fixed_translated_file,
-            visibility_res_to_fix = visibility_res_to_fix,
-            src_lang = src_language,
-            translate_to_language = dst_language,
-            punctuation = punctuation,
-            num_speakers=num_speakers)
-        changed_idx = changed_idx_fut.result()
-        if changed_idx:
-            if ttsmodel == TTS_MODEL.ELEVENLABS.value:
-                t_generate_elevenlab_segments.submit(
-                    config,
-                    speakers=speakers_array,
-                    translated_file=config.subtitles_fixed_translated_file,
-                    voices=voices,
-                    language_code=dst_language,
-                    changed_list=changed_idx
-                ).result()
-            elif ttsmodel == TTS_MODEL.INWORLD.value:
-                t_generate_inworld_segments.submit(
-                    config,
-                    speakers=speakers_array,
-                    translated_file=config.subtitles_fixed_translated_file,
-                    voices=voices,
-                    language_code=dst_language,
-                    changed_list=changed_idx
-                ).result()
-            elif ttsmodel == TTS_MODEL.CARTESIA.value:
-                t_generate_cartesia_segments.submit(
-                    config,
-                    speakers=speakers_array,
-                    translated_file=config.subtitles_fixed_translated_file,
-                    voices=voices,
-                    language_code=dst_language,
-                    changed_list=changed_idx
-                ).result()
-            elif ttsmodel == TTS_MODEL.FISHAUDIO.value:
-                t_generate_fishaudio_segments.submit(
-                    config=config,
-                    subtitles_file=config.subtitles,
-                    translated_file=config.subtitles_fixed_translated_file,
-                    voice_audio=vocal_file,
-                    speakers=speakers_array,
-                    voices=voices,
-                    language_code=dst_language,
-                    changed_list=changed_idx,
-                    run_id = run_id,
-                    force_delete=False,
-                    force_no_batch=True).result()
-            elif ttsmodel == TTS_MODEL.INDEXTTS2.value:
-                t_generate_indextts2_segments.submit(
-                    config=config,
-                    translated_file=config.subtitles_fixed_translated_file,
-                    speakers=speakers_array,
-                    emotions_tags=emotions_tags,
-                    changed_list=changed_idx,
-                ).result()
-            else:
-                raise ValueError("Unknown ttsmodel {}".format(ttsmodel))
-    else:
-        visibility_res_to_fix = None
-        build_cache = None
-        changed_idx = None
-    if stage <= STAGES.TEST_FIX_TIMING_2 and fix_timing:
-        tts_test_build_fut = t_tts_build_final.submit(config, speakers=speakers_array, convert_flag=True, subtitle_visibility_analysis=subtitle_visibility_analysis, testing=True, build_cache=build_cache, changed_list=changed_idx)
-        tts_test_build = tts_test_build_fut.result()
-        current_visibility_res_to_fix = tts_test_build['visibility_res']
-        changed_idx_fut = t_rewrite_timing_mismatched_subtitles.submit(
-            config,
-            original_subtitles = config.subtitles,
-            translated_subtitles  =config.subtitles_fixed_translated_file,
-            fixed_translated_subtitles = config.subtitles_fixed_translated_file,
-            visibility_res_to_fix = current_visibility_res_to_fix,
-            src_lang = src_language,
-            translate_to_language = dst_language,
-            punctuation = punctuation,
-            num_speakers=num_speakers,
-            prev_visibility_res_to_fix = visibility_res_to_fix,
-            prev_translated_subs_file = config.subtitles_translated_file)
-        changed_idx = changed_idx_fut.result()
-        if changed_idx:
-            if ttsmodel == TTS_MODEL.ELEVENLABS.value:
-                t_generate_elevenlab_segments.submit(
-                    config,
-                    speakers=speakers_array,
-                    translated_file=config.subtitles_fixed_translated_file,
-                    voices=voices,
-                    language_code=dst_language,
-                    changed_list=changed_idx
-                ).result()
-            elif ttsmodel == TTS_MODEL.INWORLD.value:
-                t_generate_inworld_segments.submit(
-                    config,
-                    speakers=speakers_array,
-                    translated_file=config.subtitles_fixed_translated_file,
-                    voices=voices,
-                    language_code=dst_language,
-                    changed_list=changed_idx
-                ).result()
-            elif ttsmodel == TTS_MODEL.CARTESIA.value:
-                t_generate_cartesia_segments.submit(
-                    config,
-                    speakers=speakers_array,
-                    translated_file=config.subtitles_fixed_translated_file,
-                    voices=voices,
-                    language_code=dst_language,
-                    changed_list=changed_idx
-                ).result()
-            elif ttsmodel == TTS_MODEL.FISHAUDIO.value:
-                t_generate_fishaudio_segments.submit(
-                    config=config,
-                    subtitles_file=config.subtitles,
-                    translated_file=config.subtitles_fixed_translated_file,
-                    voice_audio=vocal_file,
-                    speakers=speakers_array,
-                    voices=voices,
-                    language_code=dst_language,
-                    changed_list=changed_idx,
-                    run_id = run_id,
-                    force_delete=True,
-                    force_no_batch=False).result()
-            elif ttsmodel == TTS_MODEL.INDEXTTS2.value:
-                t_generate_indextts2_segments.submit(
-                    config=config,
-                    translated_file=config.subtitles_fixed_translated_file,
-                    speakers=speakers_array,
-                    emotions_tags=emotions_tags,
-                    changed_list=changed_idx,
-                ).result()
-            else:
-                raise ValueError("Unknown ttsmodel {}".format(ttsmodel))
-    else:
-        pass
+    # ---------------- TIMING_FIX stage: two-pass TTS timing ----------------
+    natural_per_line_atempo = None
+    speaker_base_atempo = None
+    build_cache = None
 
-    # ---------------- Two-pass TTS regen (IndexTTS2 only) ----------------
-    if ttsmodel == TTS_MODEL.INDEXTTS2.value and stage < STAGES.COMBINE:
-        regen_build = t_tts_build_final.submit(
+    if stage > STAGES.TIMING_FIX:
+        # Load saved speaker base atempo from a previous TIMING_FIX run
+        sb_path = os.path.join(config.data_output_folder, "speaker_base_atempo.json")
+        if os.path.exists(sb_path):
+            with open(sb_path, "r", encoding="utf-8") as f:
+                speaker_base_atempo = json.load(f)
+
+    if stage <= STAGES.TIMING_FIX:
+        copyfile(config.subtitles_translated_file, config.subtitles_retranslated_file)
+
+        # Step 1: Test build to measure actual durations (TTS was generated at factor=1.0)
+        test_build = t_tts_build_final.submit(
             config, speakers=speakers_array, convert_flag=True,
             subtitle_visibility_analysis=subtitle_visibility_analysis,
-            testing=True, build_cache=build_cache, changed_list=changed_idx,
+            testing=True, build_cache=build_cache, changed_list=changed_list,
+            subtitles_file=config.subtitles_retranslated_file,
         ).result()
-        regen_candidates = regen_build.get("regen_candidates", [])
-        build_cache = regen_build["build_cache"]
+        build_cache = test_build["build_cache"]
 
-        if regen_candidates:
-            regen_indices = [r["idx"] for r in regen_candidates]
-            regen_factors = {r["idx"]: r["measured_factor"] for r in regen_candidates}
-            regen_log_path = os.path.join(config.data_output_folder, "regen_factors.json")
-            with open(regen_log_path, "w", encoding="utf-8") as f:
-                json.dump(regen_candidates, f, indent=2, ensure_ascii=False)
-            t_generate_indextts2_segments.submit(
-                config=config,
-                translated_file=config.subtitles_fixed_translated_file,
-                speakers=speakers_array,
-                emotions_tags=emotions_tags,
-                changed_list=regen_indices,
-                duration_factors=regen_factors,
-            ).result()
+        # Step 2: Compute per-speaker base atempo
+        speaker_base_atempo = compute_speaker_base_atempo(
+            stats=test_build["stats"],
+            segment_meta=test_build["segment_meta"],
+        )
+        if speaker_base_atempo:
+            print(f"🎯 Natural atempo — speaker bases: {speaker_base_atempo}")
+            sf_path = os.path.join(config.data_output_folder, "speaker_base_atempo.json")
+            with open(sf_path, "w", encoding="utf-8") as f:
+                json.dump(speaker_base_atempo, f, indent=2, ensure_ascii=False)
+
+        # Step 3: Classify lines (ok / overflow / underflow)
+        classification = classify_lines(
+            stats=test_build["stats"],
+            segment_meta=test_build["segment_meta"],
+            speaker_base_atempo=speaker_base_atempo,
+        )
+        natural_per_line_atempo = classification["per_line_atempo"]
+        overflow_indices = classification["overflow_indices"]
+        underflow_indices = classification["underflow_indices"]
+
+        save_natural_timing_data(
+            output_dir=config.data_output_folder,
+            speaker_base_atempo=speaker_base_atempo,
+            per_line_atempo=natural_per_line_atempo,
+            overflow_indices=overflow_indices,
+            underflow_indices=underflow_indices,
+        )
+
+        print(f"📊 Classification: {len(overflow_indices)} overflow, {len(underflow_indices)} underflow, "
+              f"{len(natural_per_line_atempo) - len(overflow_indices) - len(underflow_indices)} ok")
+
+        # Step 4: Retranslate overflow lines (too long) and underflow lines (too short)
+        if overflow_indices or underflow_indices:
+            from post_build_fix import retranslate_timing_fix, apply_retranslation
+
+            overflow_requests = {}
+            if overflow_indices:
+                overflow_requests = build_retranslation_request(
+                    overflow_indices=overflow_indices,
+                    stats=test_build["stats"],
+                    segment_meta=test_build["segment_meta"],
+                    speaker_base_atempo=speaker_base_atempo,
+                    subtitles_file=config.subtitles_retranslated_file,
+                    source_subtitles_file=config.subtitles,
+                )
+
+            underflow_requests = {}
+            if underflow_indices:
+                underflow_requests = build_underflow_retranslation_request(
+                    underflow_indices=underflow_indices,
+                    stats=test_build["stats"],
+                    segment_meta=test_build["segment_meta"],
+                    speaker_base_atempo=speaker_base_atempo,
+                    subtitles_file=config.subtitles_retranslated_file,
+                    source_subtitles_file=config.subtitles,
+                )
+
+            candidate_texts = retranslate_timing_fix(
+                overflow_requests=overflow_requests,
+                underflow_requests=underflow_requests,
+                openai_client=config.get_openai_client(),
+                target_language=dst_language,
+            )
+
+            if candidate_texts:
+                selected = t_generate_indextts2_segments.submit(
+                    config=config,
+                    translated_file=config.subtitles_retranslated_file,
+                    speakers=speakers_array,
+                    emotions_tags=emotions_tags,
+                    changed_list=list(candidate_texts.keys()),
+                    duration_factors=None,
+                    candidate_texts=candidate_texts,
+                    speaker_base_atempo=speaker_base_atempo,
+                    warm_pods=first_tts_pods,
+                ).result()
+
+                if selected:
+                    for idx, winning_text in selected.items():
+                        apply_retranslation(idx, winning_text, config.subtitles_retranslated_file)
+
+                # Re-measure after retranslation to update per_line_atempo
+                remeasure = t_tts_build_final.submit(
+                    config, speakers=speakers_array, convert_flag=True,
+                    subtitle_visibility_analysis=subtitle_visibility_analysis,
+                    testing=True, build_cache=build_cache,
+                    changed_list=list(candidate_texts.keys()),
+                    subtitles_file=config.subtitles_retranslated_file,
+                ).result()
+                build_cache = remeasure["build_cache"]
+
+                # Recompute classification with updated measurements
+                classification = classify_lines(
+                    stats=remeasure["stats"],
+                    segment_meta=remeasure["segment_meta"],
+                    speaker_base_atempo=speaker_base_atempo,
+                )
+                natural_per_line_atempo = classification["per_line_atempo"]
 
     if stage <= STAGES.COMBINE:
-        loudness_adjust_fut = t_loudness_adjust.submit(subtitles_file=config.subtitles_fixed_translated_file, vocal_file=config.vocal_file, tts_segments_folder = config.tts_segments_folder)
+        subtitles_for_combine = config.subtitles_retranslated_file if os.path.exists(config.subtitles_retranslated_file) else config.subtitles_translated_file
+        loudness_adjust_fut = t_loudness_adjust.submit(subtitles_file=subtitles_for_combine, vocal_file=config.vocal_file, tts_segments_folder = config.tts_segments_folder)
         loudness_adjust_fut.result()
-        # subtitle_visibility_analysis=[]
-        openvoice_convert_flag = True
-        tts_build_final_fut = t_tts_build_final.submit(config, speakers= speakers_array, convert_flag = openvoice_convert_flag, subtitle_visibility_analysis = subtitle_visibility_analysis, testing = False)
+        tts_build_final_fut = t_tts_build_final.submit(config, speakers=speakers_array, convert_flag=True, subtitle_visibility_analysis=subtitle_visibility_analysis, testing=False, speaker_base_atempo=speaker_base_atempo, subtitles_file=subtitles_for_combine, max_speed_factor=1.45)
         build_audio_fut = t_build_audio.submit(config, tts_build_final_flag=tts_build_final_fut.result(),
-                                            is_dubbed=is_dubbed, mix_gains=mix_gains, use_non_speech=use_non_speech)
-        copyfile(config.subtitles_fixed_translated_file,config.subtitles_translated_file)
+                                            is_dubbed=is_dubbed, mix_gains=mix_gains, use_non_speech=use_non_speech, video_file=video_file)
         audio_result_file = build_audio_fut.result()
         if preview_proc is not None:
             preview_proc.wait()
             if preview_proc.returncode != 0:
                 Path(config.preview_base_video_file).unlink(missing_ok=True)
-        generate_videos_fut = t_generate_videos.submit(config, video_file, audio_result_file, preview=True)
-        # test_results = t_test_results.submit(audio_result_file)
+        generate_videos_fut = t_generate_videos.submit(config, video_file, audio_result_file, preview=False)
         output_file = generate_videos_fut.result()
         path = Path(config.general_config_file)
         data = json.loads(path.read_text()) if path.exists() else {}
@@ -923,7 +892,6 @@ def dubbing_flow(
         with timer("Move output to storagebox"):
             if local_dir.exists():
                 shutil.move(str(local_dir), str(Path("/mnt/storagebox") / "output" / run_id))
-        # test_results.result()
 
 
 def generate_run_id():
@@ -941,17 +909,17 @@ def preconfigure():
 # # # === Entry Point ===
 if __name__ == "__main__":
     preconfigure()
-    dubbing_flow("input/vor_rus.mp4",
+    dubbing_flow("input/osob_CUT.mp4",
                  dst_language="en",
                  trans_type='default',
                  emotions_flag=True,
                  ttsmodel=TTS_MODEL.INDEXTTS2.value,
                  elevenlabs_emotions=ELEVENLABS_EMOTIONS.HIGH.value,
                  # num_speakers=1,
-                 fix_timing=False,
                  test_mode=False,
                  changed_list=[],
-                 run_id='20260507_vor_rus',
+                 run_id='20260922_osob_CUT_09',
                  test_duration_sec=120,
                  is_dubbed=False,
-                 stage = STAGES.EMOTION.value)
+                 use_non_speech=True,
+                 stage = STAGES.SPLIT.value)

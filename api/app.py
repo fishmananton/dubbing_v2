@@ -107,13 +107,11 @@ class STAGES(IntEnum):
     SPLIT = 0
     DIARIZE = 1
     TRANSCRIBE = 2
-    TRANSLATE = 3
-    EMOTION = 4
+    EMOTION = 3
+    TRANSLATE = 4
     GENERATE = 5
-    TEST_FIX_TIMING = 6
-    TEST_FIX_TIMING_2 = 7
-    CONVERT = 8
-    COMBINE = 9
+    TIMING_FIX = 6
+    COMBINE = 7
 
 
 class ELEVENLABS_EMOTIONS(IntEnum):
@@ -145,7 +143,7 @@ FINAL_STAGE_MAP = {
         "t_translate",
         "t_detect_mouth_windows",
         "t_get_voice_profiles",
-        "t_emotion_detect",
+        "t_gemini_extract_emotions",
         "t_detect_gender",
     },
     "GENERATE": {
@@ -154,11 +152,11 @@ FINAL_STAGE_MAP = {
         "t_generate_cartesia_segments",
         "t_generate_inworld_segments",
         "t_generate_fishaudio_segments",
+        "t_generate_indextts2_segments",
         "t_combine_tts_segments",
     },
-    "SYNC": {
-        "t_rewrite_timing_mismatched_subtitles",
-        "t_openvoice_convert",
+    "TIMING_FIX": {
+        "t_tts_build_final",
     },
     "RENDER": {
         "t_loudness_adjust",
@@ -173,8 +171,8 @@ STAGE_WEIGHTS = {
     "PREPARE":    8,
     "TRANSCRIBE": 12,
     "TRANSLATE":  20,
-    "GENERATE":   35,
-    "SYNC":       15,
+    "GENERATE":   30,
+    "TIMING_FIX": 20,
     "RENDER":     10,
 }
 
@@ -188,7 +186,6 @@ class StartDubRequest(BaseModel):
     emotions_flag: bool = True
     ttsmodel: int
     elevenlabs_emotions: int = ELEVENLABS_EMOTIONS.MEDIUM.value
-    fix_timing: bool = True
     changed_list: list[int] | None = None
     is_dubbed: bool = False
     run_id: str = ""
@@ -249,26 +246,13 @@ def compute_final_stage_status(stages: list[dict]) -> dict:
     result["TRANSLATE"]  = get_stage_status(FINAL_STAGE_MAP["TRANSLATE"])
     result["GENERATE"]   = get_stage_status(FINAL_STAGE_MAP["GENERATE"])
 
-    # SYNC depends on GENERATE being done
     if result["GENERATE"] != "done":
-        result["SYNC"] = "not_started"
+        result["TIMING_FIX"] = "not_started"
     else:
-        result["SYNC"] = get_stage_status(FINAL_STAGE_MAP["SYNC"])
+        result["TIMING_FIX"] = get_stage_status(FINAL_STAGE_MAP["TIMING_FIX"])
 
-    # SYNC completion is gated on t_openvoice_convert (it also runs in RENDER via t_tts_build_final
-    # which we intentionally exclude from SYNC to avoid false positives)
-    convert_state = task_states.get("t_openvoice_convert", "")
-    if result["SYNC"] != "not_started":
-        if convert_state == "Completed":
-            result["SYNC"] = "done"
-        elif convert_state in ("Failed", "Crashed"):
-            result["SYNC"] = "failed"
-        else:
-            result["SYNC"] = "in_progress"
-
-    # RENDER depends on SYNC being done, unless no SYNC tasks ran at all (e.g. remix-only run)
-    sync_tasks_ran = any(t in task_states for t in FINAL_STAGE_MAP["SYNC"])
-    if sync_tasks_ran and result["SYNC"] != "done":
+    timing_tasks_ran = any(t in task_states for t in FINAL_STAGE_MAP["TIMING_FIX"])
+    if timing_tasks_ran and result["TIMING_FIX"] != "done":
         result["RENDER"] = "not_started"
     else:
         result["RENDER"] = get_stage_status(FINAL_STAGE_MAP["RENDER"])
@@ -675,7 +659,7 @@ async def start_dubbing_flow(req: StartDubRequest, user_id: int = Depends(requir
     video_file = run_params.get("video_file", "")
     duration_minutes = float(run_params.get("video_duration_minutes") or
                              _get_video_duration_minutes(str(_run_dir(run_id) / Path(video_file).relative_to(Path("output") / run_id)) if video_file else "") or 0)
-    cost_cents = calculate_run_cost_cents(duration_minutes, bool(req.fix_timing))
+    cost_cents = calculate_run_cost_cents(duration_minutes, False)
 
     job_id: int | None = None
     if cost_cents > 0:
@@ -694,7 +678,6 @@ async def start_dubbing_flow(req: StartDubRequest, user_id: int = Depends(requir
                 "num_speakers": req.num_speakers,
                 "emotions_flag": req.emotions_flag,
                 "elevenlabs_emotions": int(req.elevenlabs_emotions),
-                "fix_timing": req.fix_timing,
                 "changed_list": req.changed_list,
                 "is_dubbed": req.is_dubbed,
                 "run_id": run_id,
@@ -1219,7 +1202,6 @@ async def get_project_status(project_id: int, user_id: int = Depends(require_use
     is_dubbed = run_params.get("is_dubbed", False)
     emotions_flag = run_params.get("emotions_flag", True)
     trans_type = run_params.get("trans_type", "default")
-    fix_timing = run_params.get("fix_timing", True)
     mix_gains = config.get("mix_gains")
     # src_language is written by the pipeline after transcription
     src_language = config.get("src_language") or run_params.get("src_language")
@@ -1244,7 +1226,6 @@ async def get_project_status(project_id: int, user_id: int = Depends(require_use
         "is_dubbed": is_dubbed,
         "emotions_flag": emotions_flag,
         "trans_type": trans_type,
-        "fix_timing": fix_timing,
     }
 
     if output_file:
@@ -1352,7 +1333,6 @@ async def regenerate_from_subtitles(run_id: str, req: Request, user_id: int = De
             parameters={
                 **run_params,
                 "run_id": run_id,
-                "fix_timing": False,
                 "changed_list": changed_list,
                 "stage": int(STAGES.EMOTION),
             },
@@ -1406,7 +1386,6 @@ async def remix_audio(run_id: str, req: RemixRequest, user_id: int = Depends(req
         parameters={
             **run_params,
             "run_id": run_id,
-            "fix_timing": False,
             "stage": int(STAGES.COMBINE),
             "mix_gains": req.mix_gains,
         },

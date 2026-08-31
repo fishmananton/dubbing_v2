@@ -12,7 +12,6 @@ import boto3
 import re
 import unicodedata
 import json
-from runpod_utils import run_runpod_job
 from modal_utils import run_modal_job
 
 
@@ -89,7 +88,7 @@ def extract_frames(video_path, interval=0.2, start_time=0, end_time=None,image_q
 
 
 
-def get_ocr_results(boto_session: boto3.Session, bucket_name:str, runpod_key, runpod_paddleocr_id,  video_path, interval=0.5,run_id='', start_time=0.0, end_time=None):
+def get_ocr_results(boto_session: boto3.Session, bucket_name:str, video_path, interval=0.5, run_id='', start_time=0.0, end_time=None):
     s3 = boto_session.client("s3")
     s3_path = f"{run_id}/ocr/input/input.mp4"
     s3.upload_file(video_path, bucket_name, s3_path)
@@ -98,26 +97,6 @@ def get_ocr_results(boto_session: boto3.Session, bucket_name:str, runpod_key, ru
         Params={"Bucket": bucket_name, "Key": s3_path},
         ExpiresIn=3600)
 
-    runpod_payload = {'input_url': input_url,
-                      "interval": interval,
-                      "crop_bottom_fraction": 0.33,
-                      "image_quality": 2,
-                      "batch_size": 20,
-                      "start_time": start_time,
-                      "end_time": end_time,
-                      "visual_diff_threshold": 2,
-                      "use_doc_orientation_classify": False,
-                      "use_doc_unwarping": False,
-                      "use_textline_orientation": False
-                      }
-
-    # result = run_runpod_job(
-    #     runpod_key=runpod_key,
-    #     runpod_template_id=runpod_paddleocr_id,
-    #     payload=runpod_payload,
-    #     job_name="paddle_ocr",
-    #     timeout_minutes=10
-    # )
     result = run_modal_job(
         app_name="get_ocr",
         function_name="get_ocr_job",
@@ -515,14 +494,11 @@ def filter_speakable_subs(subs: list[dict]) -> list[dict]:
 
     return result
 
-def process_video_with_subs(video_path:str,boto_session: boto3.Session,client: OpenAI,model: str, bucket_name:str, runpod_key:str, runpod_paddleocr_id:str, speaker_segments:list, subtitles_file:str, language:str,num_speakers:int| None, run_id:str='', interval=0.128, start_time=0.0, end_time=None):
+def process_video_with_subs(video_path:str, boto_session: boto3.Session, client: OpenAI, model: str, bucket_name:str, speaker_segments:list, subtitles_file:str, language:str, num_speakers:int| None, run_id:str='', interval=0.128, start_time=0.0, end_time=None):
     check_language(language)
 
-    # extract_frames(video_path, frames_folder,interval=interval, start_time=start_time, end_time=end_time)
     ocr_results = get_ocr_results(boto_session=boto_session,
                                   bucket_name=bucket_name,
-                                  runpod_key=runpod_key,
-                                  runpod_paddleocr_id=runpod_paddleocr_id,
                                   video_path=video_path,
                                   interval=interval,
                                   run_id=run_id,

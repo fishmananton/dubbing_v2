@@ -1,10 +1,10 @@
-from pydub import AudioSegment
-from pydub.generators import WhiteNoise
 import requests
 import time
+import subprocess
 import tempfile
 import os
 from openai import OpenAI
+from pydub import AudioSegment
 import json
 import re
 
@@ -14,18 +14,16 @@ SYSTEM_PROMPT = """You are a subtitle quality-control editor. Your task is to fi
     1. DIARIZATION: Identify and correct logical speaker assignment errors. Do not invent a new conversation flow from scratch, but actively fix obvious flaws where the original diarization failed (including splitting a single original label if it mistakenly groups a back-and-forth conversation).
     2. ROLES: Replace generic speaker labels with consistent, descriptive English role names based on context. Target exactly {num_speakers} unique roles unless your corrections change the actual speaker count.
     3. SEGMENTATION: If a grammatical phrase or sentence is split across 2 or MORE consecutive subtitles by the SAME speaker, Set "merge_into_next": true on EVERY subtitle that must attach to the following one.
-    4. TEXT PRESERVATION: Keep the `"text"` exactly as provided. Do NOT translate or paraphrase. Do NOT combine the text yourself when flagging a merge.
-    5. Maintain exactly consistent role names throughout the entire array. Do not use synonyms for the same character.
+    4. Maintain exactly consistent role names throughout the entire array. Do not use synonyms for the same character.
 
     OUTPUT FORMAT:
-    Return a STRICT JSON object containing only the `subtitles` array.
+    Return a STRICT JSON object containing only the `subtitles` array. Do NOT include "text" — only index, speaker, and merge_into_next.
 
     {
       "subtitles": [
         {
           "index": 1,
           "speaker": "Assigned Role",
-          "text": "original text strictly preserved",
           "merge_into_next": false
         }
       ]
@@ -160,7 +158,7 @@ def fix_sub_diarization_with_ai(
             {"role": "user", "content": text},
         ],
         reasoning_effort="medium",
-        response_format={"type": "json_object"}
+        response_format={"type": "json_object"},
     )
 
     raw = response.choices[0].message.content.strip()
@@ -182,7 +180,6 @@ def fix_sub_diarization_with_ai(
 
         fix_map[idx] = {
             "speaker": str(item.get("speaker", "")).strip(),
-            "text": str(item.get("text", "")).strip(),
             "merge_into_next": bool(item.get("merge_into_next", False)),
         }
 
@@ -197,9 +194,6 @@ def fix_sub_diarization_with_ai(
         if fix:
             if fix["speaker"]:
                 new_row["speaker"] = fix["speaker"]
-
-            if fix["text"]:
-                new_row["text"] = fix["text"]
 
             new_row["merge_into_next"] = fix["merge_into_next"]
         else:
@@ -263,80 +257,102 @@ def _expand_numbers(text: str, lang: str) -> str:
     return _DIGIT_RE.sub(_replace, text)
 
 
-def assemblyai_transcribe(audio_file_raw: str, subtitles_file: str, speaker_segments: list, assemblyai_api_key: str,
-                          openai_client: OpenAI,
-                          openai_model: str,
-                          num_speakers: int | None,
-                          language: str = 'auto', pause_split_threshold: float = 0.4):
-    # Fill only silent regions with -50dB white noise to prevent ASR timing bugs on digital silence
-    from pydub.silence import detect_silence
-    audio = AudioSegment.from_file(audio_file_raw)
-    silent_ranges = detect_silence(audio, min_silence_len=200, silence_thresh=-50)
-    if silent_ranges:
-        if silent_ranges[0][0] == 0:
-            silent_ranges = silent_ranges[1:]
-        if silent_ranges and silent_ranges[-1][1] >= len(audio) - 50:
-            silent_ranges = silent_ranges[:-1]
-    if silent_ranges:
-        noise_ref = WhiteNoise().to_audio_segment(duration=1)
-        target_dbfs = -50
-        gain_adjust = target_dbfs - noise_ref.dBFS
-        for start_ms, end_ms in silent_ranges:
-            chunk_noise = WhiteNoise().to_audio_segment(duration=end_ms - start_ms).apply_gain(gain_adjust)
-            chunk_noise = chunk_noise.set_channels(audio.channels).set_frame_rate(audio.frame_rate).set_sample_width(audio.sample_width)
-            audio = audio.overlay(chunk_noise, position=start_ms)
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        audio.export(tmp.name, format="wav")
-        tmp.close()
-        upload_file = tmp.name
-    else:
-        upload_file = audio_file_raw
+def _merge_short_adjacent_subs(segments: list[dict], max_dur: float = 0.4, max_gap: float = 1.0) -> list[dict]:
+    """Merge ultra-short same-speaker adjacent subs that are undubbable individually."""
+    if not segments:
+        return segments
+    merged = []
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        dur = seg["end"] - seg["start"]
+        if dur < max_dur and i + 1 < len(segments):
+            nxt = segments[i + 1]
+            nxt_dur = nxt["end"] - nxt["start"]
+            gap = nxt["start"] - seg["end"]
+            if seg["speaker"] == nxt["speaker"] and gap < max_gap and nxt_dur < max_dur:
+                merged.append({
+                    **seg,
+                    "end": nxt["end"],
+                    "text": seg["text"] + " " + nxt["text"],
+                })
+                i += 2
+                continue
+        merged.append(seg)
+        i += 1
+    return merged
+
+
+def assemblyai_transcribe_raw(audio_file_raw: str, assemblyai_api_key: str):
+    t0 = time.time()
+
+    mp3_file = tempfile.mktemp(suffix=".mp3")
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "quiet", "-i", audio_file_raw, "-q:a", "2", mp3_file],
+        check=True,
+    )
+    file_size_mb = os.path.getsize(mp3_file) / 1024 / 1024
+    print(f"  [transcribe] mp3 encode: {time.time() - t0:.1f}s (file: {file_size_mb:.1f}MB)")
 
     base_url = "https://api.assemblyai.com"
     headers = {
         "authorization": f"{assemblyai_api_key}",
         "content-type": "application/octet-stream"
     }
+    t1 = time.time()
     try:
-        with open(upload_file, "rb") as f:
+        with open(mp3_file, "rb") as f:
             response = requests.post(base_url + "/v2/upload", headers=headers, data=f, timeout=(10, 300))
         response.raise_for_status()
     finally:
-        if upload_file != audio_file_raw:
-            os.unlink(upload_file)
+        os.unlink(mp3_file)
 
     upload_response = response.json()
     audio_url = upload_response["upload_url"]
+    print(f"  [transcribe] upload to AssemblyAI: {time.time() - t1:.1f}s")
 
     data = {
         "audio_url": audio_url,
         "speech_models": ["universal-3-5-pro", "universal-2"],
         "language_detection": True,
-        "disfluencies": False
+        "disfluencies": False,
+        "format_text": False,
     }
 
+    t2 = time.time()
     response = requests.post(base_url + "/v2/transcript", json=data, headers=headers, timeout=(10, 300))
     response.raise_for_status()
     transcript_id = response.json()['id']
 
+    poll_count = 0
     while True:
         response = requests.get(base_url + "/v2/transcript/" + transcript_id, headers=headers, timeout=(10, 300))
-        response.raise_for_status()  # Raise error if fetch failed
+        response.raise_for_status()
         transcription = response.json()
         if transcription['status'] == 'completed':
             break
         elif transcription['status'] == 'error':
             raise RuntimeError(f"Transcription failed: {transcription['error']}")
         else:
+            poll_count += 1
             time.sleep(3)
+    print(f"  [transcribe] AssemblyAI processing: {time.time() - t2:.1f}s ({poll_count} polls)")
 
     trans_language = transcription.get("language_code", "ko").split('_')[0]
-
-    # Fetch flat words array directly from the main transcription object
     words_data = transcription.get("words", [])
+    print(f"  [transcribe] got {len(words_data)} words, language: {trans_language}")
+    print(f"  [transcribe] raw transcription total: {time.time() - t0:.1f}s")
+
+    return words_data, trans_language
+
+
+def assemble_transcription(words_data: list, trans_language: str, speaker_segments: list,
+                           subtitles_file: str, openai_client: OpenAI, openai_model: str,
+                           num_speakers: int | None, pause_split_threshold: float = 0.4):
+    t0 = time.time()
 
     segments = []
-    max_subtitle_duration = 7  # Max seconds a subtitle should stay on screen
+    max_subtitle_duration = 7
     last_known_speaker = ""
 
     current_text = []
@@ -357,6 +373,14 @@ def assemblyai_transcribe(audio_file_raw: str, subtitles_file: str, speaker_segm
         end_in_speech = any(seg["start"] <= w_end <= seg["end"] for seg in speaker_segments)
 
         if not start_in_speech or not end_in_speech:
+            if not start_in_speech and not end_in_speech:
+                min_dist = min(
+                    (min(abs(w_start - seg["end"]), abs(w_start - seg["start"])) for seg in speaker_segments),
+                    default=999
+                )
+                if min_dist > 0.5:
+                    continue
+
             w_idx = words_data.index(w)
 
             # Find forward anchor: next word that's in speech
@@ -466,6 +490,9 @@ def assemblyai_transcribe(audio_file_raw: str, subtitles_file: str, speaker_segm
 
     segments = filter_speakable_subs(segments)
 
+    # ---- 4.5 Merge ultra-short same-speaker adjacent subs (dubbing-aware)
+    segments = _merge_short_adjacent_subs(segments)
+
     # ---- 5. Sort and save to SRT
     segments.sort(key=lambda x: x["start"])
     for i, seg in enumerate(segments, 1):
@@ -474,12 +501,14 @@ def assemblyai_transcribe(audio_file_raw: str, subtitles_file: str, speaker_segm
     unique_speakers = len(set(seg["speaker"] for seg in segments))
     actual_num_speakers = num_speakers if num_speakers is not None else unique_speakers
 
+    t4 = time.time()
     segments = fix_sub_diarization_with_ai(
         openai_client,
         openai_model,
         segments,
         actual_num_speakers,
     )
+    print(f"  [transcribe] AI diarization fix: {time.time() - t4:.1f}s ({len(segments)} final segments)")
 
     with open(subtitles_file, "w", encoding="utf-8") as f:
         for i, seg in enumerate(segments, 1):
@@ -487,4 +516,15 @@ def assemblyai_transcribe(audio_file_raw: str, subtitles_file: str, speaker_segm
             f.write(f"{srt_timestamp(seg['start'])} --> {srt_timestamp(seg['end'])}\n")
             f.write(f"{seg['speaker']}: {seg['text']}\n\n")
 
+    print(f"  [transcribe] assembly total: {time.time() - t0:.1f}s")
     return trans_language
+
+
+def assemblyai_transcribe(audio_file_raw: str, subtitles_file: str, speaker_segments: list, assemblyai_api_key: str,
+                          openai_client: OpenAI,
+                          openai_model: str,
+                          num_speakers: int | None,
+                          language: str = 'auto', pause_split_threshold: float = 0.4):
+    words_data, trans_language = assemblyai_transcribe_raw(audio_file_raw, assemblyai_api_key)
+    return assemble_transcription(words_data, trans_language, speaker_segments, subtitles_file,
+                                  openai_client, openai_model, num_speakers, pause_split_threshold)

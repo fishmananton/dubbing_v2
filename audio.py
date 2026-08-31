@@ -6,7 +6,6 @@ import copy
 import tempfile
 import soundfile as sf
 import torchaudio
-from runpod_utils import run_runpod_job
 from modal_utils import run_modal_job
 import os
 import threading
@@ -148,70 +147,58 @@ def split_audio(
         output_vocal: str,
         output_music: str,
         output_vocal_asr: str):
-    s3_input_file = f"{run_id}/split_audio/input/input.wav"
-    s3_output_vocal = f"{run_id}/split_audio/output/vocal.wav"
-    s3_output_music = f"{run_id}/split_audio/output/music.wav"
-    s3 = boto_session.client("s3")
-    s3.upload_file(input_audio, bucket_name, s3_input_file)
-    input_url = s3.generate_presigned_url(
-        ClientMethod="get_object",
-        Params={"Bucket": bucket_name, "Key": s3_input_file},
-        ExpiresIn=3600
-    )
-    output_vocal_url = s3.generate_presigned_url(
-        ClientMethod="put_object",
-        Params={"Bucket": bucket_name, "Key": s3_output_vocal},
-        ExpiresIn=3600
-    )
-    output_music_url = s3.generate_presigned_url(
-        ClientMethod="put_object",
-        Params={"Bucket": bucket_name, "Key": s3_output_music},
-        ExpiresIn=3600
-    )
+    import modal
 
-    runpod_payload = {
-        "input_url": input_url,
-        "output_vocal_url": output_vocal_url,
-        "output_music_url": output_music_url
-    }
+    vol = modal.Volume.from_name("dubbing-transfer")
+    vol_prefix = f"split_{run_id}"
+
+    input_flac = tempfile.mktemp(suffix=".flac")
+    try:
+        print(f"[split_audio] Compressing WAV -> FLAC...")
+        subprocess.run(["ffmpeg", "-y", "-i", input_audio, input_flac], check=True, capture_output=True)
+
+        print(f"[split_audio] Uploading FLAC to Modal Volume...")
+        with vol.batch_upload(force=True) as batch:
+            batch.put_file(input_flac, f"{vol_prefix}/input.flac")
+    finally:
+        if os.path.exists(input_flac):
+            os.remove(input_flac)
 
     result = run_modal_job(
         app_name="audio-dubbing-separator",
         function_name="split_audio_job",
         timeout_minutes=30,
         poll_delay_sec=5,
-        input_url=input_url,
-        output_vocal_url=output_vocal_url,
-        output_music_url=output_music_url,
+        run_id=vol_prefix,
     )
 
-    # result = run_runpod_job(
-    #     runpod_key=runpod_key,
-    #     runpod_template_id=runpod_template_id,
-    #     payload=runpod_payload,
-    #     job_name="split_audio",
-    #     timeout_minutes=10
-    # )
-    # split_audio_fn = modal.Function.from_name("split-audio", "split_audio_job")
-    #
-    # result = split_audio_fn.remote(
-    #     input_url=input_url,
-    #     output_vocal_url=output_vocal_url,
-    #     output_music_url=output_music_url,
-    # )
-
-    if result["status"] == "COMPLETED":
-        s3.download_file(bucket_name, s3_output_vocal, output_vocal)
-        s3.download_file(bucket_name, s3_output_music, output_music)
-        resample_wav(output_vocal, PIPELINE_SR)
-        resample_wav(output_music, PIPELINE_SR)
-        prepare_vocal_asr(output_vocal, output_vocal_asr)
-
-    s3.delete_object(Bucket=bucket_name, Key=s3_input_file)
-    s3.delete_object(Bucket=bucket_name, Key=s3_output_vocal)
-    s3.delete_object(Bucket=bucket_name, Key=s3_output_music)
     if result["status"] != "COMPLETED":
-        raise Exception(f"Didn't split audio. job_id {result['job_id']}")
+        raise Exception(f"split_audio failed for {run_id}")
+
+    print(f"[split_audio] Downloading results from Modal Volume...")
+    vocal_flac = tempfile.mktemp(suffix=".flac")
+    music_flac = tempfile.mktemp(suffix=".flac")
+    try:
+        with open(vocal_flac, "wb") as f:
+            for chunk in vol.read_file(f"{vol_prefix}/vocal.flac"):
+                f.write(chunk)
+        with open(music_flac, "wb") as f:
+            for chunk in vol.read_file(f"{vol_prefix}/music.flac"):
+                f.write(chunk)
+
+        print(f"[split_audio] Decompressing FLAC -> WAV...")
+        subprocess.run(["ffmpeg", "-y", "-i", vocal_flac, output_vocal], check=True, capture_output=True)
+        subprocess.run(["ffmpeg", "-y", "-i", music_flac, output_music], check=True, capture_output=True)
+    finally:
+        for f in [vocal_flac, music_flac]:
+            if os.path.exists(f):
+                os.remove(f)
+
+    vol.remove_file(vol_prefix, recursive=True)
+
+    resample_wav(output_vocal, PIPELINE_SR)
+    resample_wav(output_music, PIPELINE_SR)
+    prepare_vocal_asr(output_vocal, output_vocal_asr)
 
 
 

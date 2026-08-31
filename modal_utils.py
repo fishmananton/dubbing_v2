@@ -2,26 +2,38 @@ import time
 from typing import Any
 import modal
 
-_function_cache: dict[tuple[str, str], modal.Function] = {}
+_function_cache: dict[tuple[str, str, str | None], Any] = {}
 
 
-def _get_modal_function(app_name: str, function_name: str) -> modal.Function:
-    key = (app_name, function_name)
-    fn = _function_cache.get(key)
-    if fn is None:
-        fn = modal.Function.from_name(app_name, function_name)
-        _function_cache[key] = fn
-    return fn
+def _get_modal_callable(app_name: str, class_name: str | None = None, method_name: str | None = None, function_name: str | None = None):
+    if class_name and method_name:
+        key = (app_name, class_name, method_name)
+        fn = _function_cache.get(key)
+        if fn is None:
+            cls = modal.Cls.from_name(app_name, class_name)
+            instance = cls()
+            fn = getattr(instance, method_name)
+            _function_cache[key] = fn
+        return fn
+    else:
+        key = (app_name, function_name, None)
+        fn = _function_cache.get(key)
+        if fn is None:
+            fn = modal.Function.from_name(app_name, function_name)
+            _function_cache[key] = fn
+        return fn
 
 
 def run_modal_job(
     app_name: str,
-    function_name: str,
     timeout_minutes: int = 10,
     poll_delay_sec: int = 5,
+    function_name: str | None = None,
+    class_name: str | None = None,
+    method_name: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    fn = _get_modal_function(app_name, function_name)
+    fn = _get_modal_callable(app_name, class_name=class_name, method_name=method_name, function_name=function_name)
     call = fn.spawn(**kwargs)
 
     print(f"[{app_name}] Modal started.")

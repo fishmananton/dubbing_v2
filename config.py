@@ -48,6 +48,7 @@ class Configuration:
 
         self.subtitles_translated_file = f"{self.data_output_folder}/subtitles_translated.srt"
         self.subtitles_fixed_translated_file = f"{self.data_output_folder}/subtitles_fixed_translated.srt"
+        self.subtitles_retranslated_file = f"{self.data_output_folder}/subtitles_retranslated.srt"
         self.subtitles = f"{self.data_output_folder}/subtitles.srt"
 
         self.final_video_file = f"{self.global_output_folder}/final_video.mp4"
@@ -58,18 +59,10 @@ class Configuration:
         self.boto3_profile = os.getenv("BOTO3_PROFILE", "research")
         self.s3_bucket_name = os.getenv("S3_BUCKET_NAME", "fishmanresearch")
 
-        self.runpod_key = os.getenv("RUNPOD_KEY")
-        self.runpod_split_id = os.getenv("RUNPOD_SPLIT_ID")
-        self.runpod_paddleocr_id = os.getenv("RUNPOD_PADDLEOCR_ID")
-        self.runpod_openvoice_id = os.getenv("RUNPOD_OPENVOICE_ID")
-        self.runpod_emotion_detect_id = os.getenv("RUNPOD_EMOTION_DETECT_ID")
         self.pyannote_key = os.getenv("PYANNOTE_KEY")
 
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        self.openai_diarization_model = "gpt-5.6-luna"  # diarization.py / whisper / assemblyai / alibaba / OCR speaker repair
-        self.openai_emotion_model = "gpt-5.4-nano"      # emotion label fixes
-        self.openai_timing_model = "gpt-5.4"            # timing rewrites
-        self.openai_translate_model = "gpt-5.4"         # translation
+        self.openai_diarization_model = "gpt-5.6-luna"
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         self.anthropic_translate_pass1_model = "claude-sonnet-5"  # pass1: batch draft
         self.anthropic_translate_pass2_model = "claude-opus-5"    # pass2: targeted reroll
