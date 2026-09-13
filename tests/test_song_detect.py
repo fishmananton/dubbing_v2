@@ -65,3 +65,28 @@ def test_build_chunk_script_rebases_times_keeps_ids():
     assert "10.00-12.00" in script
     # no absolute 605/610 leaked
     assert "605" not in script and "610" not in script
+
+
+from song_detect import drop_sub_ids
+
+
+def test_drop_sub_ids_removes_and_keeps_original_indices(tmp_path):
+    subs = [_sub(1, 0, 1, "a"), _sub(2, 2, 3, "b"),
+            _sub(3, 4, 5, "c"), _sub(4, 6, 7, "d")]
+    p = tmp_path / "translated.srt"
+    p.write_text(srt.compose(subs, reindex=False), encoding="utf-8")
+
+    removed = drop_sub_ids(str(p), [2, 3])
+    assert removed == [2, 3]
+
+    kept = list(srt.parse(p.read_text(encoding="utf-8")))
+    assert [s.index for s in kept] == [1, 4]  # originals preserved, not renumbered
+
+
+def test_drop_sub_ids_empty_is_noop(tmp_path):
+    subs = [_sub(1, 0, 1, "a"), _sub(2, 2, 3, "b")]
+    p = tmp_path / "translated.srt"
+    original = srt.compose(subs, reindex=False)
+    p.write_text(original, encoding="utf-8")
+    assert drop_sub_ids(str(p), []) == []
+    assert list(s.index for s in srt.parse(p.read_text(encoding="utf-8"))) == [1, 2]

@@ -96,3 +96,20 @@ def build_chunk_script(chunk: Chunk) -> str:
         end = s.end.total_seconds()
         lines.append(f"[{s.index}] {start:.2f}-{end:.2f}  {s.content}")
     return "\n".join(lines)
+
+
+def drop_sub_ids(srt_path: str, ids: list[int]) -> list[int]:
+    """Remove subtitles whose index is in `ids` from the SRT file, in place.
+    reindex=False keeps surviving indices stable. Returns the IDs actually
+    removed."""
+    id_set = set(ids)
+    if not id_set:
+        return []
+    subs = list(srt.parse(open(srt_path, encoding="utf-8").read()))
+    present = {s.index for s in subs}
+    remaining = [s for s in subs if s.index not in id_set]
+    removed = sorted(id_set & present)
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write(srt.compose(sorted(remaining, key=lambda x: x.start),
+                            reindex=False))
+    return removed
