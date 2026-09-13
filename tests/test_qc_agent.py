@@ -46,6 +46,18 @@ def test_normalization_edit_text():
     assert decisions[0].auto_apply is True
 
 
+def test_edit_text_missing_param_not_auto_applied():
+    # High confidence edit_text but no new_text param. The writer would KeyError
+    # mid-loop, so the gate must refuse to auto-apply (C2).
+    raw = [{"idx": 2, "primitive": "edit_text", "confidence": 0.99,
+            "diagnosis": "reword", "params": {},
+            "playbook_pattern_matched": False}]
+    bundle = {2: {"mismatch_signal": {"long_activity_short_text": False}}}
+    decisions = decide([Issue(2)], bundle, [], model_call=fake_model(raw))
+    assert decisions[0].primitive == "edit_text"
+    assert decisions[0].auto_apply is False
+
+
 def test_ambiguous_becomes_propose():
     raw = [{"idx": 3, "primitive": "propose", "confidence": 0.5,
             "diagnosis": "unclear", "params": {"suggested_fix": "human review"},

@@ -21,6 +21,21 @@ PRIMITIVE_THRESHOLDS: dict[str, float] = {
 
 APPLIABLE_PRIMITIVES = set(PRIMITIVE_THRESHOLDS.keys())
 
+# Params each primitive's writer requires. A decision missing any of these cannot be
+# auto-applied — the writers index these keys directly, so a partial set would KeyError
+# mid-loop and leave the SRT/emotions file half-mutated. drop_line needs no params.
+REQUIRED_PARAMS: dict[str, tuple[str, ...]] = {
+    "edit_text": ("new_text",),
+    "change_speaker": ("new_speaker",),
+    "change_timing": ("new_start_ms", "new_end_ms"),
+    "set_emotion": ("tag", "category", "vector"),
+    "drop_line": (),
+}
+
+
+def has_required_params(d: "Decision") -> bool:
+    return all(k in d.params for k in REQUIRED_PARAMS.get(d.primitive, ()))
+
 # Higher tier = higher risk; used to break same-idx collisions.
 COLLISION_TIER: dict[str, int] = {
     "drop_line": 4,
@@ -54,6 +69,9 @@ def apply_gate(decisions: list[Decision]) -> None:
     """Set d.auto_apply in place. propose never auto-applies."""
     for d in decisions:
         if d.primitive not in APPLIABLE_PRIMITIVES:
+            d.auto_apply = False
+            continue
+        if not has_required_params(d):
             d.auto_apply = False
             continue
         threshold = PRIMITIVE_THRESHOLDS[d.primitive]
@@ -172,7 +190,7 @@ def apply_fixes(decisions: list[Decision], subtitles_file: str,
     timing/drop) or emotions_tags.json (emotion). Returns changed indices for regen."""
     changed: list[int] = []
     for d in decisions:
-        if not d.auto_apply:
+        if not d.auto_apply or not has_required_params(d):
             continue
         p, prm = d.primitive, d.params
         if p == "edit_text":
