@@ -210,24 +210,39 @@ def main() -> None:
         subs_path = retrans if os.path.exists(retrans) else trans
     print(f"subs: {os.path.basename(subs_path)}")
 
-    script = build_script(subs_path)
-    audio_bytes = compress_audio(audio_path)
-    print(f"audio: {len(audio_bytes)/1e6:.2f} MB opus | script: {len(script)} chars")
+    import srt as _srt
+    from song_detect import chunk_subs, build_chunk_script, slice_audio_opus
+
+    subs = list(_srt.parse(open(subs_path, encoding="utf-8").read()))
+    chunks = chunk_subs(subs)
+    print(f"audio: {len(chunks)} chunk(s)")
 
     api_key = os.getenv("GEMINI_API_KEY")
     model = args.model or os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
     print(f"model: {model}")
     client = genai.Client(api_key=api_key)
 
-    merged = qc_check(
-        audio_bytes=audio_bytes,
-        script=script,
-        client=client,
-        model=model,
-        passes=args.passes,
-        temperature=args.temperature,
-        thinking_level=args.thinking_level,
-    )
+    all_issues: list[Issue] = []
+    for ci, chunk in enumerate(chunks):
+        chunk_script = build_chunk_script(chunk)
+        audio_bytes = slice_audio_opus(audio_path, chunk.offset_s, chunk.end_s)
+        print(f"  chunk {ci+1}/{len(chunks)}: {len(audio_bytes)/1e6:.2f} MB opus")
+        issues = qc_check(
+            audio_bytes=audio_bytes,
+            script=chunk_script,
+            client=client,
+            model=model,
+            passes=args.passes,
+            temperature=args.temperature,
+            thinking_level=args.thinking_level,
+        )
+        # rebase issue timestamps back to absolute for the report
+        for it in issues:
+            it.start += chunk.offset_s
+            it.end += chunk.offset_s
+        all_issues.extend(issues)
+
+    merged = dedup_issues(all_issues)
     print(f"\n===== {len(merged)} ISSUE(S) (union of {args.passes} passes) =====")
     for it in merged:
         print(f"\n[{it.severity.value.upper()}] "
