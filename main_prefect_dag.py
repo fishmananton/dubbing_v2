@@ -42,6 +42,7 @@ from test_results import qc_check
 from qc_agent import decide as qc_decide
 from qc_evidence import build_evidence_bundle
 from qc_fixes import apply_fixes, load_playbook, resolve_collisions
+from song_detect import detect_songs, drop_sub_ids
 from qc_tail import (append_promotion_queue, build_fix_log, diff_reqc,
                      split_auto_and_proposals, write_fix_log)
 from test_dub_qc import build_script, compress_audio, qc_check as qc_listen_check
@@ -99,6 +100,24 @@ def t_gemini_extract_emotions(config, audio_file, subtitles_file):
             output_file=config.gemini_emotions_file,
         )
     return speakers
+
+
+@task(cache_policy=NO_CACHE)
+def t_detect_songs(config, audio_file, subtitles_file):
+    """Return subtitle IDs that are sung lyrics (to be dropped before GENERATE).
+    Runs in the EMOTION-stage parallel fan-out. Never raises: on error returns []
+    so the dub proceeds with songs dubbed (pre-existing behavior)."""
+    with timer("Detect songs"):
+        try:
+            from google import genai
+            client = genai.Client(api_key=config.gemini_api_key)
+            ids = detect_songs(audio_file, subtitles_file, client,
+                               config.gemini_model)
+            print(f"🎵 song detection: {len(ids)} sung line(s) -> drop {ids}")
+            return ids
+        except Exception as e:  # noqa: BLE001 — must never fail the dub
+            print(f"⚠️  song detection failed ({e}); keeping all lines")
+            return []
 
 
 @task
@@ -683,6 +702,7 @@ def dubbing_flow(
     gemini_emotions_fut = None
     detect_gender_fut = None
     mouth_windows_fut = None
+    detect_songs_fut = None
     prewarm_handles = None
     prewarm_pods = 0
 
@@ -693,6 +713,8 @@ def dubbing_flow(
                                                    gemini_api_key=config.gemini_api_key,
                                                    gemini_model=config.gemini_model)
         mouth_windows_fut = t_detect_mouth_windows.submit(video_file, config.subtitles)
+        detect_songs_fut = t_detect_songs.submit(config, config.audio_file,
+                                                 config.subtitles)
         if ttsmodel == TTS_MODEL.INDEXTTS2.value:
             prewarm_handles, prewarm_pods = prewarm_indextts2(config.subtitles)
 
@@ -730,6 +752,12 @@ def dubbing_flow(
     if translated_fut:
         translate_stats = translated_fut.result()
     translated_file = config.subtitles_translated_file
+
+    if detect_songs_fut is not None:
+        song_ids = detect_songs_fut.result()
+        if song_ids:
+            dropped = drop_sub_ids(config.subtitles_translated_file, song_ids)
+            print(f"🎵 dropped {len(dropped)} sung line(s) from translated SRT: {dropped}")
 
     if stage <= STAGES.GENERATE:
         cut_speakers_fut = t_cut_speakers.submit(vocal_file=vocal_asr_file, subtitles_file = config.subtitles, speakers_array=speakers_array, emotions_tags=emotions_tags, speakers_folder = config.speakers_folder)
