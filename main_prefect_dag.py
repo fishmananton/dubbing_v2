@@ -1127,4 +1127,4 @@ if __name__ == "__main__":
                  # test_duration_sec=120,
                  is_dubbed=False,
                  use_non_speech=True,
-                 stage = STAGES.TRANSCRIBE.value)
+                 stage = STAGES.COMBINE.value)
