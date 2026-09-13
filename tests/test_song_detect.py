@@ -90,3 +90,42 @@ def test_drop_sub_ids_empty_is_noop(tmp_path):
     p.write_text(original, encoding="utf-8")
     assert drop_sub_ids(str(p), []) == []
     assert list(s.index for s in srt.parse(p.read_text(encoding="utf-8"))) == [1, 2]
+
+
+import song_detect as sd
+
+
+def test_detect_songs_unions_ids_across_chunks(tmp_path, monkeypatch):
+    # 20 min of subs -> forces >1 chunk; stub the per-chunk call.
+    subs = []
+    t = 0.0
+    idx = 1
+    while t < 1200:
+        subs.append(_sub(idx, t, t + 1.0))
+        gap = 5.0 if 600 <= t < 601 else 1.0
+        t += 1.0 + gap
+        idx += 1
+    p = tmp_path / "subs.srt"
+    p.write_text(srt.compose(subs, reindex=False), encoding="utf-8")
+
+    calls = {"n": 0}
+
+    def fake_chunk_call(chunk, audio_path, client, model, thinking_level="MEDIUM"):
+        calls["n"] += 1
+        # each chunk "finds" its first sub's id as sung
+        return [chunk.subs[0].index]
+
+    monkeypatch.setattr(sd, "detect_songs_in_chunk", fake_chunk_call)
+
+    ids = sd.detect_songs(audio_path="/nonexistent.wav", subtitles_path=str(p),
+                          client=object(), model="m")
+    assert calls["n"] >= 2               # multiple chunks were processed
+    assert ids == sorted(set(ids))       # sorted unique
+    assert len(ids) == calls["n"]        # one id unioned per chunk
+
+
+def test_detect_songs_empty_subs_returns_empty(tmp_path):
+    p = tmp_path / "subs.srt"
+    p.write_text("", encoding="utf-8")
+    assert sd.detect_songs(audio_path="/x.wav", subtitles_path=str(p),
+                           client=object(), model="m") == []

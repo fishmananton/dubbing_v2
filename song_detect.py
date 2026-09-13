@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -178,3 +179,25 @@ def detect_songs_in_chunk(chunk: Chunk, audio_path: str, client, model: str,
     got = json.loads(r.text).get("sung_indices", [])
     # keep only IDs that actually belong to this chunk (guard against drift)
     return [int(i) for i in got if int(i) in valid]
+
+
+def detect_songs(audio_path: str, subtitles_path: str, client, model: str,
+                 thinking_level: str = "MEDIUM",
+                 target_min: float = 10.0, min_split_min: float = 12.0,
+                 gap_min_s: float = 2.0) -> list[int]:
+    """Return sorted unique subtitle IDs that are sung lyrics. One Gemini call per
+    chunk, unioned. Original IDs (never rebased)."""
+    subs = list(srt.parse(open(subtitles_path, encoding="utf-8").read()))
+    if not subs:
+        return []
+    chunks = chunk_subs(subs, target_min=target_min,
+                        min_split_min=min_split_min, gap_min_s=gap_min_s)
+    sung: set[int] = set()
+    with ThreadPoolExecutor(max_workers=max(1, len(chunks))) as pool:
+        results = pool.map(
+            lambda c: detect_songs_in_chunk(c, audio_path, client, model,
+                                            thinking_level),
+            chunks)
+        for r in results:
+            sung.update(r)
+    return sorted(sung)
