@@ -85,3 +85,34 @@ def test_model_failure_yields_all_proposals():
     assert len(decisions) == 2
     assert all(d.primitive == "propose" and d.auto_apply is False
                for d in decisions)
+
+
+def test_qc_check_is_importable_and_unions_passes(monkeypatch):
+    import test_dub_qc as qc
+
+    class FakeParsed:
+        def __init__(self, issues):
+            self.issues = issues
+
+    class FakeResp:
+        def __init__(self, issues):
+            self.parsed = FakeParsed(issues)
+
+    calls = {"n": 0}
+
+    class FakeModels:
+        def generate_content(self, model, contents, config):
+            calls["n"] += 1
+            return FakeResp([qc.Issue(start=1.0, end=2.0, sub_index=7,
+                                      symptom="x", mismatch="y",
+                                      severity=qc.Severity.high)])
+
+    class FakeClient:
+        models = FakeModels()
+
+    issues = qc.qc_check(audio_bytes=b"opus", script="[7] 1.00-2.00  S: hi",
+                         client=FakeClient(), model="fake", passes=3,
+                         temperature=0.4, thinking_level="LOW")
+    assert calls["n"] == 3
+    assert len(issues) == 1  # 3 identical passes union down to one
+    assert issues[0].sub_index == 7

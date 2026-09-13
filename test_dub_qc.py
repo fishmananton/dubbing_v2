@@ -136,6 +136,51 @@ def compress_audio(wav_path: str) -> bytes:
     return buf.getvalue()
 
 
+def qc_check(
+    audio_bytes: bytes,
+    script: str,
+    client,
+    model: str,
+    passes: int = 3,
+    temperature: float = 0.4,
+    thinking_level: str = "MEDIUM",
+) -> list[Issue]:
+    """Run `passes` independent Gemini review passes over the compressed audio +
+    script and return the deduped union of issues. Shared by the CLI and the
+    pipeline's post-COMBINE QC-fix stage."""
+    prompt = (
+        "Here is the subtitle script the dub was built from "
+        "(format: [index] start-end  Speaker: text):\n\n"
+        f"{script}\n\n"
+        "Now listen to the final dubbed audio and report any defects."
+    )
+    contents = [
+        genai.types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+        prompt,
+    ]
+    gen_config = genai.types.GenerateContentConfig(
+        system_instruction=QC_SYSTEM_PROMPT,
+        temperature=temperature,
+        thinking_config=genai.types.ThinkingConfig(thinking_level=thinking_level),
+        response_mime_type="application/json",
+        response_schema=QCReport,
+    )
+
+    def run_pass(p: int) -> list[Issue]:
+        r = client.models.generate_content(
+            model=model, contents=contents, config=gen_config)
+        report = r.parsed
+        found = report.issues if report else []
+        print(f"pass {p + 1}/{passes}: {len(found)} issue(s)")
+        return found
+
+    all_issues: list[Issue] = []
+    with ThreadPoolExecutor(max_workers=passes) as pool:
+        for found in pool.map(run_pass, range(passes)):
+            all_issues.extend(found)
+    return dedup_issues(all_issues)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True, help="Path to output/<run_id>")
@@ -174,41 +219,15 @@ def main() -> None:
     print(f"model: {model}")
     client = genai.Client(api_key=api_key)
 
-    prompt = (
-        "Here is the subtitle script the dub was built from "
-        "(format: [index] start-end  Speaker: text):\n\n"
-        f"{script}\n\n"
-        "Now listen to the final dubbed audio and report any defects."
-    )
-
-    contents = [
-        genai.types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
-        prompt,
-    ]
-    config = genai.types.GenerateContentConfig(
-        system_instruction=QC_SYSTEM_PROMPT,
+    merged = qc_check(
+        audio_bytes=audio_bytes,
+        script=script,
+        client=client,
+        model=model,
+        passes=args.passes,
         temperature=args.temperature,
-        thinking_config=genai.types.ThinkingConfig(
-            thinking_level=args.thinking_level,
-        ),
-        response_mime_type="application/json",
-        response_schema=QCReport,
+        thinking_level=args.thinking_level,
     )
-
-    def run_pass(p: int) -> list[Issue]:
-        r = client.models.generate_content(
-            model=model, contents=contents, config=config)
-        report: Optional[QCReport] = r.parsed
-        found = report.issues if report else []
-        print(f"pass {p + 1}/{args.passes}: {len(found)} issue(s)")
-        return found
-
-    all_issues: list[Issue] = []
-    with ThreadPoolExecutor(max_workers=args.passes) as pool:
-        for found in pool.map(run_pass, range(args.passes)):
-            all_issues.extend(found)
-
-    merged = dedup_issues(all_issues)
     print(f"\n===== {len(merged)} ISSUE(S) (union of {args.passes} passes) =====")
     for it in merged:
         print(f"\n[{it.severity.value.upper()}] "
