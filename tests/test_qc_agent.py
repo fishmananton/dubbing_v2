@@ -50,9 +50,46 @@ def test_ambiguous_becomes_propose():
     raw = [{"idx": 3, "primitive": "propose", "confidence": 0.5,
             "diagnosis": "unclear", "params": {"suggested_fix": "human review"},
             "playbook_pattern_matched": False}]
-    decisions = decide([Issue(3)], _bundle(3), [], model_call=fake_model(raw))
+    # Genuinely ambiguous: no concrete fix param and no hallucination signal.
+    bundle = {3: {"mismatch_signal": {"long_activity_short_text": False}}}
+    decisions = decide([Issue(3)], bundle, [], model_call=fake_model(raw))
     assert decisions[0].primitive == "propose"
     assert decisions[0].auto_apply is False
+
+
+def test_propose_with_concrete_text_promoted_to_edit_text():
+    # The model hedged to 'propose' but supplied a concrete new_text at high
+    # confidence (the real idx-29 8:45 case). Promote to edit_text so the gate applies.
+    raw = [{"sub_index": 29, "primitive": "propose", "confidence": 0.95,
+            "params": {"new_text": "DevOps: at eight forty-five"},
+            "playbook_pattern_matched": True}]
+    decisions = decide([Issue(29)], _bundle(29), [], model_call=fake_model(raw))
+    assert decisions[0].primitive == "edit_text"
+    assert decisions[0].auto_apply is True
+
+
+def test_propose_without_concrete_fix_stays_propose():
+    # A bare propose with no actionable param AND no hallucination signal stays propose.
+    raw = [{"idx": 4, "primitive": "propose", "confidence": 0.99,
+            "params": {"suggested_fix": "human should relisten"}}]
+    bundle = {4: {"mismatch_signal": {"long_activity_short_text": False}}}
+    decisions = decide([Issue(4)], bundle, [], model_call=fake_model(raw))
+    assert decisions[0].primitive == "propose"
+    assert decisions[0].auto_apply is False
+
+
+def test_propose_on_hallucination_evidence_promoted_to_drop_line():
+    # Model hedged to propose with empty params, but the evidence shows the non-speech
+    # hallucination signature (the real scream idx-20 case). Promote to drop_line; with
+    # the playbook boost it clears the 0.90 gate and auto-applies.
+    raw = [{"sub_index": 20, "primitive": "propose", "confidence": 0.85,
+            "params": {}, "playbook_pattern_matched": True}]
+    bundle = {20: {"mismatch_signal": {"long_activity_short_text": True}}}
+    playbook = [{"pattern": "scream", "primitive": "drop_line",
+                 "confidence_boost": 0.10}]
+    decisions = decide([Issue(20)], bundle, playbook, model_call=fake_model(raw))
+    assert decisions[0].primitive == "drop_line"
+    assert decisions[0].auto_apply is True  # 0.85 + 0.10 = 0.95 >= 0.90
 
 
 def test_phase2_invoked_when_audio_requested():

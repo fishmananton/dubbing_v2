@@ -70,11 +70,14 @@ def build_evidence_bundle(issues, config) -> dict:
     retrans = _subs_by_idx(os.path.join(d, "subtitles_retranslated.srt"))
     emotions = _load_json(os.path.join(d, "emotions_tags.json"), {})
     diar = _load_json(os.path.join(d, "speakers_segments_data.json"), [])
-    stats_doc = _load_json(os.path.join(d, "build_final_stats.json"), {})
-    stats_by_idx = {row["index"]: row for row in stats_doc.get("stats", [])}
+    stats_doc = _load_json(os.path.join(d, "build_final_stats.json"), [])
+    stats_rows = stats_doc.get("stats", []) if isinstance(stats_doc, dict) else stats_doc
+    stats_by_idx = {row["index"]: row for row in stats_rows}
     natural = _load_json(os.path.join(d, "natural_timing.json"), {})
     per_line_atempo = natural.get("per_line_atempo", {})
-    visibility = _load_json(os.path.join(d, "subtitles_visibility.json"), {})
+    visibility_doc = _load_json(os.path.join(d, "subtitles_visibility.json"), [])
+    visibility = ({row["index"]: row for row in visibility_doc}
+                  if isinstance(visibility_doc, list) else visibility_doc)
 
     bundle: dict[int, dict] = {}
     for issue in issues:
@@ -99,6 +102,6 @@ def build_evidence_bundle(issues, config) -> dict:
             "emotion": emotions.get(str(idx), {}),
             "timing": stats_by_idx.get(idx, {}),
             "per_line_atempo": per_line_atempo.get(str(idx)),
-            "visibility": visibility.get(str(idx), {}),
+            "visibility": visibility.get(idx, visibility.get(str(idx), {})),
         }
     return bundle

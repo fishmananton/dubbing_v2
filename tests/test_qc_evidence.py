@@ -28,13 +28,16 @@ def test_bundle_shape(tmp_path, monkeypatch):
                           "emo_vector": [0.0]}}))
     (data / "speakers_segments_data.json").write_text(
         json.dumps([{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}]))
+    # build_final_stats.json is a bare list in production, not a {"stats": [...]} wrapper.
     (data / "build_final_stats.json").write_text(
-        json.dumps({"stats": [{"index": 1, "final_fit_ratio": 1.0,
-                               "spill_vs_subtitle_ms": 0, "applied_speed_factor": 1.0,
-                               "timing_status": "good"}]}))
+        json.dumps([{"index": 1, "final_fit_ratio": 1.0,
+                     "spill_vs_subtitle_ms": 0, "applied_speed_factor": 1.0,
+                     "timing_status": "good"}]))
     (data / "natural_timing.json").write_text(
         json.dumps({"per_line_atempo": {"1": 1.0}}))
-    (data / "subtitles_visibility.json").write_text(json.dumps({}))
+    # subtitles_visibility.json is a bare list keyed by "index" in production.
+    (data / "subtitles_visibility.json").write_text(
+        json.dumps([{"index": 1, "has_visible_speaking": True}]))
 
     class FakeConfig:
         data_output_folder = str(data)
@@ -58,4 +61,5 @@ def test_bundle_shape(tmp_path, monkeypatch):
         {"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}]
     assert entry["emotion"]["category"] == "neutral"
     assert entry["timing"]["timing_status"] == "good"
+    assert entry["visibility"]["has_visible_speaking"] is True
     assert "mismatch_signal" in entry
