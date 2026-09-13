@@ -129,3 +129,23 @@ def test_detect_songs_empty_subs_returns_empty(tmp_path):
     p.write_text("", encoding="utf-8")
     assert sd.detect_songs(audio_path="/x.wav", subtitles_path=str(p),
                            client=object(), model="m") == []
+
+
+import os
+import pytest
+
+
+@pytest.mark.skipif(not os.getenv("GEMINI_API_KEY"),
+                    reason="needs GEMINI_API_KEY + network")
+def test_detect_songs_taxi_ground_truth():
+    from google import genai
+    run = "output/20260903_taxi_CUT_02"
+    audio = os.path.join(run, "audio/audio.wav")
+    subs = os.path.join(run, "data/subtitles.srt")
+    if not (os.path.exists(audio) and os.path.exists(subs)):
+        pytest.skip("taxi run not present")
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+    ids = set(sd.detect_songs(audio, subs, client, model))
+    assert {101, 102, 103, 104, 105, 106, 107} <= ids, f"missed rap: {sorted(ids)}"
+    assert not ({24, 25} & ids), f"false positive on dialogue-over-music: {sorted(ids)}"
