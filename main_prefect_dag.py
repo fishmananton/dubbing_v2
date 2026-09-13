@@ -429,6 +429,116 @@ def resolve_timing_caps(ttsmodel: int, dst_language: str) -> dict:
             or DEFAULT_TIMING_CAPS)
 
 
+def _regen_and_combine(
+    config,
+    speakers_array,
+    emotions_tags,
+    subtitle_visibility_analysis,
+    dst_language,
+    ttsmodel,
+    speaker_base_atempo,
+    timing_overflow_threshold,
+    timing_max_speed_factor,
+    is_dubbed,
+    mix_gains,
+    use_non_speech,
+    video_file,
+    changed_list,
+    build_cache=None,
+    qc_fix: bool = False,
+):
+    """Run GENERATE(scoped)→timing→COMBINE once. In qc_fix mode: freeze retranslated
+    as truth (pre-sync into translated), reuse the saved per-speaker atempo, classify
+    only changed lines, skip retranslation (clamp+spill), then COMBINE (rebuilds the
+    non-speech layer via the relocated split_vocal). Returns the final audio path."""
+    import shutil
+
+    is_qwen3 = ttsmodel == TTS_MODEL.QWEN3TTS.value
+
+    if qc_fix:
+        # Pre-sync: retranslated holds all prior rerolls + agent edits. Copy it into
+        # translated so GENERATE reads the frozen truth. Makes the TIMING_FIX-top
+        # copyfile(translated -> retranslated) a harmless no-op.
+        if os.path.exists(config.subtitles_retranslated_file):
+            shutil.copyfile(config.subtitles_retranslated_file,
+                            config.subtitles_translated_file)
+
+    # --- GENERATE (scoped to changed_list) ---
+    regen_file = config.subtitles_retranslated_file
+    if is_qwen3:
+        t_generate_qwen3tts_segments.submit(
+            config=config, translated_file=regen_file, speakers=speakers_array,
+            emotions_tags=emotions_tags, language_code=dst_language,
+            changed_list=changed_list,
+        ).result()
+    else:
+        t_generate_indextts2_segments.submit(
+            config=config, translated_file=regen_file, speakers=speakers_array,
+            emotions_tags=emotions_tags, changed_list=changed_list,
+            duration_factors=None, warm_pods=0,
+        ).result()
+
+    t_combine_tts_segments.submit(speakers_array, config.tts_segments_folder).result()
+
+    # --- Timing: no whole-track re-measure; classify only changed lines ---
+    if qc_fix:
+        sb_path = os.path.join(config.data_output_folder, "speaker_base_atempo.json")
+        if os.path.exists(sb_path):
+            speaker_base_atempo = json.loads(open(sb_path, encoding="utf-8").read())
+
+        remeasure = t_tts_build_final.submit(
+            config, speakers=speakers_array, convert_flag=True,
+            subtitle_visibility_analysis=subtitle_visibility_analysis,
+            testing=True, build_cache=build_cache, changed_list=changed_list,
+            subtitles_file=config.subtitles_retranslated_file,
+        ).result()
+        build_cache = remeasure["build_cache"]
+
+        classification = classify_lines(
+            stats=remeasure["stats"], segment_meta=remeasure["segment_meta"],
+            speaker_base_atempo=speaker_base_atempo,
+            overflow_threshold=timing_overflow_threshold,
+        )
+        # Merge changed lines' atempo into the saved natural_timing.json (don't shift
+        # other lines). Skip retranslation entirely — clamp+spill on longer fixes.
+        natural = _load_json_or(
+            os.path.join(config.data_output_folder, "natural_timing.json"),
+            {"per_line_atempo": {}})
+        natural["per_line_atempo"].update(
+            {str(k): v for k, v in classification["per_line_atempo"].items()})
+        with open(os.path.join(config.data_output_folder, "natural_timing.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump(natural, f, indent=2, ensure_ascii=False)
+
+    # --- COMBINE (includes relocated split_vocal) ---
+    subtitles_for_combine = (config.subtitles_retranslated_file
+                             if os.path.exists(config.subtitles_retranslated_file)
+                             else config.subtitles_translated_file)
+    t_loudness_adjust.submit(subtitles_file=subtitles_for_combine,
+                             vocal_file=config.vocal_file,
+                             tts_segments_folder=config.tts_segments_folder).result()
+    split_vocal_fut = t_split_vocal.submit(
+        config.vocal_file, subtitles_for_combine, config.non_speech_layer_file)
+    tts_build_final_fut = t_tts_build_final.submit(
+        config, speakers=speakers_array, convert_flag=True,
+        subtitle_visibility_analysis=subtitle_visibility_analysis, testing=False,
+        speaker_base_atempo=speaker_base_atempo, subtitles_file=subtitles_for_combine,
+        max_speed_factor=timing_max_speed_factor)
+    split_vocal_fut.result()
+    build_audio_fut = t_build_audio.submit(
+        config, tts_build_final_flag=tts_build_final_fut.result(),
+        is_dubbed=is_dubbed, mix_gains=mix_gains, use_non_speech=use_non_speech,
+        video_file=video_file)
+    return build_audio_fut.result()
+
+
+def _load_json_or(path: str, default):
+    try:
+        return json.loads(open(path, encoding="utf-8").read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
 # === Main Flow ===
 @flow(name="video-dubbing-pipeline", task_runner=ConcurrentTaskRunner(max_workers=6))
 def dubbing_flow(
