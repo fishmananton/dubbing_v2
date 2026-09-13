@@ -44,3 +44,41 @@ def test_playbook_boost_pushes_over_threshold():
     d.playbook_boost = 0.10
     apply_gate([d])
     assert d.auto_apply is True
+
+
+from qc_fixes import resolve_collisions
+
+
+def test_no_collision_passes_through():
+    a = make(1, "edit_text", 0.9, new_text="a")
+    b = make(2, "drop_line", 0.95)
+    a.auto_apply = b.auto_apply = True
+    kept = resolve_collisions([a, b])
+    assert {d.idx for d in kept} == {1, 2}
+
+
+def test_higher_tier_wins_same_idx():
+    text = make(1, "edit_text", 0.9, new_text="a")
+    drop = make(1, "drop_line", 0.95)
+    text.auto_apply = drop.auto_apply = True
+    kept = resolve_collisions([text, drop])
+    assert len(kept) == 1
+    assert kept[0].primitive == "drop_line"
+
+
+def test_same_field_conflict_downgrades_both():
+    a = make(1, "edit_text", 0.9, new_text="a")
+    b = make(1, "edit_text", 0.9, new_text="b")
+    a.auto_apply = b.auto_apply = True
+    kept = resolve_collisions([a, b])
+    assert kept == []  # both downgraded, neither auto-applied
+    assert a.auto_apply is False and b.auto_apply is False
+
+
+def test_different_fields_same_idx_coexist():
+    # timing + text touch different fields -> both kept
+    t = make(1, "change_timing", 0.9, new_start_ms=1000, new_end_ms=2000)
+    x = make(1, "edit_text", 0.9, new_text="hi")
+    t.auto_apply = x.auto_apply = True
+    kept = resolve_collisions([t, x])
+    assert {d.primitive for d in kept} == {"change_timing", "edit_text"}

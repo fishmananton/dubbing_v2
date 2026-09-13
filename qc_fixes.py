@@ -52,3 +52,57 @@ def apply_gate(decisions: list[Decision]) -> None:
             continue
         threshold = PRIMITIVE_THRESHOLDS[d.primitive]
         d.auto_apply = effective_confidence(d) >= threshold
+
+
+# Which SRT/artifact field each primitive writes. Primitives touching different
+# fields on the same line can coexist; same-field conflicts must be downgraded.
+PRIMITIVE_FIELD: dict[str, str] = {
+    "edit_text": "text",
+    "drop_line": "line",       # removes the whole line -> conflicts with everything
+    "change_timing": "timing",
+    "change_speaker": "speaker",
+    "set_emotion": "emotion",
+}
+
+
+def _downgrade(d: Decision) -> None:
+    d.auto_apply = False
+    d.outcome = "proposed"
+
+
+def resolve_collisions(auto: list[Decision]) -> list[Decision]:
+    """Dedupe auto-apply decisions by idx. Same-field conflict -> downgrade both.
+    Different fields -> keep both. drop_line removes the line, so it conflicts with
+    any other primitive on that idx and wins by tier. Done in code, not the model."""
+    by_idx: dict[int, list[Decision]] = {}
+    for d in auto:
+        by_idx.setdefault(d.idx, []).append(d)
+
+    kept: list[Decision] = []
+    for idx, group in by_idx.items():
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+
+        # drop_line on this idx supersedes everything else on the line.
+        drops = [d for d in group if d.primitive == "drop_line"]
+        if drops:
+            winner = max(drops, key=lambda d: effective_confidence(d))
+            for d in group:
+                if d is not winner:
+                    _downgrade(d)
+            kept.append(winner)
+            continue
+
+        # Group remaining by field; same-field conflict downgrades all in that field.
+        by_field: dict[str, list[Decision]] = {}
+        for d in group:
+            by_field.setdefault(PRIMITIVE_FIELD[d.primitive], []).append(d)
+
+        for field_decisions in by_field.values():
+            if len(field_decisions) == 1:
+                kept.append(field_decisions[0])
+            else:
+                for d in field_decisions:
+                    _downgrade(d)
+    return kept
