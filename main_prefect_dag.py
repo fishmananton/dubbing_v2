@@ -589,7 +589,6 @@ def dubbing_flow(
 
     # --- TRANSLATE stage (runs in parallel with Gemini emotions + mouth detection) ---
     translated_fut = None
-    split_vocal_fut = None
 
     if stage <= STAGES.TRANSLATE:
         translated_fut = t_translate.submit(config, subtitles=config.subtitles,
@@ -598,7 +597,6 @@ def dubbing_flow(
                                             subtitles_translated=config.subtitles_translated_file,
                                             punctuation=punctuation,
                                             speakers_data=speakers_array)
-        split_vocal_fut = t_split_vocal.submit(vocal_file, config.subtitles, config.non_speech_layer_file)
 
     # Now wait for Gemini emotions (which has been running in parallel with translate)
     if gemini_emotions_fut:
@@ -615,8 +613,6 @@ def dubbing_flow(
 
     if translated_fut:
         translate_stats = translated_fut.result()
-    if split_vocal_fut:
-        split_vocal_fut.result()
     translated_file = config.subtitles_translated_file
 
     if stage <= STAGES.GENERATE:
@@ -875,9 +871,17 @@ def dubbing_flow(
 
     if stage <= STAGES.COMBINE:
         subtitles_for_combine = config.subtitles_retranslated_file if os.path.exists(config.subtitles_retranslated_file) else config.subtitles_translated_file
+        # Non-speech layer (laughs/screams/reactions) is carved from the ORIGINAL
+        # vocal for spans not covered by a subtitle. Built here (not at TRANSLATE) so
+        # a QC-fix cycle — which re-runs COMBINE after drop_line/change_timing edits —
+        # rebuilds it against the frozen retranslated subs. Runs parallel to the timing
+        # build; both only feed build_audio, so it costs no wall-clock time.
+        split_vocal_fut = t_split_vocal.submit(
+            vocal_file, subtitles_for_combine, config.non_speech_layer_file)
         loudness_adjust_fut = t_loudness_adjust.submit(subtitles_file=subtitles_for_combine, vocal_file=config.vocal_file, tts_segments_folder = config.tts_segments_folder)
         loudness_adjust_fut.result()
         tts_build_final_fut = t_tts_build_final.submit(config, speakers=speakers_array, convert_flag=True, subtitle_visibility_analysis=subtitle_visibility_analysis, testing=False, speaker_base_atempo=speaker_base_atempo, subtitles_file=subtitles_for_combine, max_speed_factor=timing_max_speed_factor)
+        split_vocal_fut.result()
         build_audio_fut = t_build_audio.submit(config, tts_build_final_flag=tts_build_final_fut.result(),
                                             is_dubbed=is_dubbed, mix_gains=mix_gains, use_non_speech=use_non_speech, video_file=video_file)
         audio_result_file = build_audio_fut.result()
