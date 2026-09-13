@@ -82,3 +82,96 @@ def test_different_fields_same_idx_coexist():
     t.auto_apply = x.auto_apply = True
     kept = resolve_collisions([t, x])
     assert {d.primitive for d in kept} == {"change_timing", "edit_text"}
+
+
+import json
+from datetime import timedelta
+
+import srt as _srt
+
+from qc_fixes import apply_fixes
+
+
+def _write_srt(path, rows):
+    subs = [
+        _srt.Subtitle(index=i, start=timedelta(seconds=s), end=timedelta(seconds=e),
+                      content=c)
+        for (i, s, e, c) in rows
+    ]
+    path.write_text(_srt.compose(subs, reindex=False))
+
+
+def _read_subs(path):
+    return {s.index: s for s in _srt.parse(path.read_text())}
+
+
+def test_edit_text_rewrites_keeping_speaker(tmp_path):
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(1, 0, 2, "SPEAKER_00: at eight forty five")])
+    d = make(1, "edit_text", 0.9, new_text="at 8:45")
+    d.auto_apply = True
+    changed = apply_fixes([d], subtitles_file=str(srt_path),
+                          emotions_file=str(tmp_path / "emo.json"))
+    assert changed == [1]
+    assert _read_subs(srt_path)[1].content == "SPEAKER_00: at 8:45"
+
+
+def test_drop_line_removes_line(tmp_path):
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(1, 0, 2, "SPEAKER_00: hi"),
+                          (2, 2, 4, "SPEAKER_00: AAAAH")])
+    d = make(2, "drop_line", 0.95)
+    d.auto_apply = True
+    changed = apply_fixes([d], subtitles_file=str(srt_path),
+                          emotions_file=str(tmp_path / "emo.json"))
+    assert changed == [2]
+    assert 2 not in _read_subs(srt_path)
+
+
+def test_change_speaker_rewrites_prefix(tmp_path):
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(1, 0, 2, "SPEAKER_00: hi there")])
+    d = make(1, "change_speaker", 0.9, new_speaker="SPEAKER_01")
+    d.auto_apply = True
+    apply_fixes([d], subtitles_file=str(srt_path),
+                emotions_file=str(tmp_path / "emo.json"))
+    assert _read_subs(srt_path)[1].content == "SPEAKER_01: hi there"
+
+
+def test_change_timing_rewrites_window(tmp_path):
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(1, 0.0, 2.0, "SPEAKER_00: hi")])
+    d = make(1, "change_timing", 0.9, new_start_ms=500, new_end_ms=1800)
+    d.auto_apply = True
+    apply_fixes([d], subtitles_file=str(srt_path),
+                emotions_file=str(tmp_path / "emo.json"))
+    sub = _read_subs(srt_path)[1]
+    assert sub.start == timedelta(milliseconds=500)
+    assert sub.end == timedelta(milliseconds=1800)
+
+
+def test_set_emotion_overwrites_tags_file(tmp_path):
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(1, 0, 2, "SPEAKER_00: hi")])
+    emo = tmp_path / "emo.json"
+    emo.write_text(json.dumps({"1": {"emotion_tag": "[calm]", "category": "neutral",
+                                     "emo_vector": [0, 0]}}))
+    d = make(1, "set_emotion", 0.9, tag="[furious]", category="angry",
+             vector=[1.0, 0.0])
+    d.auto_apply = True
+    apply_fixes([d], subtitles_file=str(srt_path), emotions_file=str(emo))
+    data = json.loads(emo.read_text())
+    assert data["1"]["emotion_tag"] == "[furious]"
+    assert data["1"]["category"] == "angry"
+    assert data["1"]["emo_vector"] == [1.0, 0.0]
+
+
+def test_only_auto_apply_decisions_are_written(tmp_path):
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(1, 0, 2, "SPEAKER_00: original")])
+    d = make(1, "edit_text", 0.5, new_text="ignored")
+    d.auto_apply = False
+    changed = apply_fixes([d], subtitles_file=str(srt_path),
+                          emotions_file=str(tmp_path / "emo.json"))
+    assert changed == []
+    assert _read_subs(srt_path)[1].content == "SPEAKER_00: original"

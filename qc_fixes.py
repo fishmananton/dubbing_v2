@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
+
+import srt as _srt
+
+from post_build_fix import apply_retranslation
 
 # Per-primitive auto-apply thresholds (spec Auto-Apply Gate).
 # Reflect blast radius; all primitives are reversible.
@@ -106,3 +112,79 @@ def resolve_collisions(auto: list[Decision]) -> list[Decision]:
                 for d in field_decisions:
                     _downgrade(d)
     return kept
+
+
+def _drop_line(idx: int, subtitles_file: str) -> list[int]:
+    subs = list(_srt.parse(open(subtitles_file, encoding="utf-8").read()))
+    remaining = [s for s in subs if s.index != idx]
+    if len(remaining) == len(subs):
+        return []
+    with open(subtitles_file, "w", encoding="utf-8") as f:
+        f.write(_srt.compose(sorted(remaining, key=lambda x: x.start), reindex=False))
+    return [idx]
+
+
+def _change_speaker(idx: int, new_speaker: str, subtitles_file: str) -> list[int]:
+    subs = list(_srt.parse(open(subtitles_file, encoding="utf-8").read()))
+    for sub in subs:
+        if sub.index == idx:
+            text = sub.content.split(":", 1)[1].strip() if ":" in sub.content else sub.content
+            sub.content = f"{new_speaker}: {text}"
+            break
+    else:
+        return []
+    with open(subtitles_file, "w", encoding="utf-8") as f:
+        f.write(_srt.compose(sorted(subs, key=lambda x: x.start), reindex=False))
+    return [idx]
+
+
+def _change_timing(idx: int, new_start_ms: int, new_end_ms: int,
+                   subtitles_file: str) -> list[int]:
+    subs = list(_srt.parse(open(subtitles_file, encoding="utf-8").read()))
+    for sub in subs:
+        if sub.index == idx:
+            sub.start = timedelta(milliseconds=new_start_ms)
+            sub.end = timedelta(milliseconds=new_end_ms)
+            break
+    else:
+        return []
+    with open(subtitles_file, "w", encoding="utf-8") as f:
+        f.write(_srt.compose(sorted(subs, key=lambda x: x.start), reindex=False))
+    return [idx]
+
+
+def _set_emotion(idx: int, tag: str, category: str, vector: list[float],
+                 emotions_file: str) -> list[int]:
+    data = {}
+    try:
+        data = json.loads(open(emotions_file, encoding="utf-8").read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    data[str(idx)] = {"emotion_tag": tag, "category": category, "emo_vector": vector}
+    with open(emotions_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+    return [idx]
+
+
+def apply_fixes(decisions: list[Decision], subtitles_file: str,
+                emotions_file: str) -> list[int]:
+    """Write each auto-apply decision to the frozen retranslated SRT (text/speaker/
+    timing/drop) or emotions_tags.json (emotion). Returns changed indices for regen."""
+    changed: list[int] = []
+    for d in decisions:
+        if not d.auto_apply:
+            continue
+        p, prm = d.primitive, d.params
+        if p == "edit_text":
+            changed += apply_retranslation(d.idx, prm["new_text"], subtitles_file)
+        elif p == "drop_line":
+            changed += _drop_line(d.idx, subtitles_file)
+        elif p == "change_speaker":
+            changed += _change_speaker(d.idx, prm["new_speaker"], subtitles_file)
+        elif p == "change_timing":
+            changed += _change_timing(d.idx, prm["new_start_ms"],
+                                      prm["new_end_ms"], subtitles_file)
+        elif p == "set_emotion":
+            changed += _set_emotion(d.idx, prm["tag"], prm["category"],
+                                    prm["vector"], emotions_file)
+    return sorted(set(changed))
