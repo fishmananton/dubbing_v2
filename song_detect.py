@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 
 import srt
+from google import genai
 from pydub import AudioSegment
 
 from test_dub_qc import build_script, compress_audio
@@ -113,3 +114,67 @@ def drop_sub_ids(srt_path: str, ids: list[int]) -> list[int]:
         f.write(srt.compose(sorted(remaining, key=lambda x: x.start),
                             reindex=False))
     return removed
+
+
+SONG_SYSTEM_PROMPT = (
+    "You are an audio analyst for a film dubbing pipeline. You are given a slice "
+    "of the original-language film audio and the subtitle script transcribed from "
+    "it (format: [index] start-end  Speaker: text), with timestamps relative to "
+    "this audio slice. Some subtitle lines are SUNG song lyrics (a musical number, "
+    "rap, or singing), not spoken dialogue. Sung lines must NOT be dubbed. "
+    "Dialogue spoken over background music is NOT sung and must be kept. Listen to "
+    "the audio and identify which subtitle lines are sung lyrics rather than "
+    "spoken dialogue. Return only the integer subtitle indices that are sung."
+)
+
+
+def _song_schema():
+    return genai.types.Schema(
+        type=genai.types.Type.OBJECT,
+        properties={
+            "sung_indices": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(type=genai.types.Type.INTEGER),
+            )
+        },
+        required=["sung_indices"],
+    )
+
+
+def slice_audio_opus(audio_path: str, offset_s: float, end_s: float) -> bytes:
+    """Cut [offset_s, end_s] from audio_path to 0-based mono opus bytes."""
+    seg = AudioSegment.from_file(audio_path).set_channels(1)
+    clip = seg[int(offset_s * 1000):int(end_s * 1000)]
+    buf = io.BytesIO()
+    clip.export(buf, format="ogg", codec="libopus", bitrate="48k")
+    return buf.getvalue()
+
+
+def detect_songs_in_chunk(chunk: Chunk, audio_path: str, client, model: str,
+                          thinking_level: str = "MEDIUM") -> list[int]:
+    """One Gemini call: return the sung subtitle IDs in this chunk."""
+    audio_bytes = slice_audio_opus(audio_path, chunk.offset_s, chunk.end_s)
+    script = build_chunk_script(chunk)
+    prompt = (
+        "Here is the subtitle script for this audio slice "
+        "(format: [index] start-end  Speaker: text):\n\n"
+        f"{script}\n\n"
+        "Now listen to the audio and return the indices of lines that are SUNG "
+        "song lyrics, not spoken dialogue."
+    )
+    contents = [
+        genai.types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+        prompt,
+    ]
+    config = genai.types.GenerateContentConfig(
+        system_instruction=SONG_SYSTEM_PROMPT,
+        temperature=0.4,
+        thinking_config=genai.types.ThinkingConfig(thinking_level=thinking_level),
+        response_mime_type="application/json",
+        response_schema=_song_schema(),
+    )
+    r = client.models.generate_content(model=model, contents=contents, config=config)
+    valid = {s.index for s in chunk.subs}
+    got = json.loads(r.text).get("sung_indices", [])
+    # keep only IDs that actually belong to this chunk (guard against drift)
+    return [int(i) for i in got if int(i) in valid]
