@@ -218,6 +218,18 @@ def t_translate(config, subtitles, src_lang, translate_to_language, subtitles_tr
     return result
 
 
+@task(cache_policy=NO_CACHE)
+def t_retranslate_timing_fix(config, overflow_requests, underflow_requests, target_language):
+    with timer("Timing retranslation"):
+        from post_build_fix import retranslate_timing_fix
+        result = retranslate_timing_fix(
+            overflow_requests=overflow_requests,
+            underflow_requests=underflow_requests,
+            openai_client=config.get_openai_client(),
+            target_language=target_language,
+            model=config.timing_retranslate_model,
+        )
+    return result
 
 
 
@@ -932,7 +944,7 @@ def dubbing_flow(
 
         # Step 4: Retranslate overflow lines (too long) and underflow lines (too short)
         if overflow_indices or underflow_indices:
-            from post_build_fix import retranslate_timing_fix, apply_retranslation
+            from post_build_fix import apply_retranslation
 
             overflow_requests = {}
             if overflow_indices:
@@ -957,13 +969,12 @@ def dubbing_flow(
                     source_subtitles_file=config.subtitles,
                 )
 
-            candidate_texts = retranslate_timing_fix(
+            candidate_texts = t_retranslate_timing_fix.submit(
+                config=config,
                 overflow_requests=overflow_requests,
                 underflow_requests=underflow_requests,
-                openai_client=config.get_openai_client(),
                 target_language=dst_language,
-                model=config.timing_retranslate_model,
-            )
+            ).result()
 
             if candidate_texts:
                 if is_qwen3:
@@ -1142,17 +1153,17 @@ def preconfigure():
 # # # === Entry Point ===
 if __name__ == "__main__":
     preconfigure()
-    dubbing_flow("input/barkoni.mp4",
-                 dst_language="en",
+    dubbing_flow("input/taxi_CUT.mp4",
+                 dst_language="ru",
                  trans_type='default',
                  emotions_flag=True,
-                 ttsmodel=TTS_MODEL.INDEXTTS2.value,
+                 ttsmodel=TTS_MODEL.QWEN3TTS.value,
                  elevenlabs_emotions=ELEVENLABS_EMOTIONS.HIGH.value,
                  # num_speakers=1,
                  test_mode=False,
                  changed_list=[],
-                 run_id='20260903_barkoni_10',
+                 run_id='20260903_taxi_CUT_03',
                  # test_duration_sec=120,
                  is_dubbed=False,
                  use_non_speech=True,
-                 stage = STAGES.COMBINE.value)
+                 stage = STAGES.SPLIT.value)
