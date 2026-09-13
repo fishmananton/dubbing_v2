@@ -116,6 +116,12 @@ def test_detect_songs_unions_ids_across_chunks(tmp_path, monkeypatch):
         return [chunk.subs[0].index]
 
     monkeypatch.setattr(sd, "detect_songs_in_chunk", fake_chunk_call)
+    # decode is stubbed: this test exercises union logic only (no real audio)
+    class _FakeSeg:
+        def set_channels(self, n):
+            return self
+    monkeypatch.setattr(sd.AudioSegment, "from_file",
+                        staticmethod(lambda *a, **k: _FakeSeg()))
 
     ids = sd.detect_songs(audio_path="/nonexistent.wav", subtitles_path=str(p),
                           client=object(), model="m")

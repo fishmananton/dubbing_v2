@@ -42,10 +42,10 @@ def _gaps(subs: list) -> list[tuple[float, float, int]]:
 
 def chunk_subs(subs: list, target_min: float = 10.0,
                min_split_min: float = 12.0, gap_min_s: float = 2.0) -> list[Chunk]:
-    """Split subs into chunks. <= min_split_min total -> single chunk. Else split
-    near each target_min mark at the >gap_min_s inter-sub gap nearest the mark
-    (cut at gap midpoint). If no qualifying gap near/after a mark, the chunk runs
-    on to the next qualifying gap (oversized allowed)."""
+    """Split subs into chunks. <= min_split_min total -> single chunk. Else, past
+    each target_min mark, split at the first >gap_min_s inter-sub gap at/after the
+    mark (cut at gap midpoint). This only ever overshoots the mark, never cuts
+    mid-sub; if no qualifying gap follows, the chunk runs on (oversized allowed)."""
     if not subs:
         return []
     subs = sorted(subs, key=lambda s: s.start)
@@ -139,19 +139,22 @@ def _song_schema():
     )
 
 
-def slice_audio_opus(audio_path: str, offset_s: float, end_s: float) -> bytes:
-    """Cut [offset_s, end_s] from audio_path to 0-based mono opus bytes."""
-    seg = AudioSegment.from_file(audio_path).set_channels(1)
+def slice_audio_opus(audio, offset_s: float, end_s: float) -> bytes:
+    """Cut [offset_s, end_s] to 0-based mono opus bytes. `audio` is a file path or
+    a preloaded mono AudioSegment (decode once, slice many)."""
+    seg = (AudioSegment.from_file(audio).set_channels(1)
+           if isinstance(audio, str) else audio)
     clip = seg[int(offset_s * 1000):int(end_s * 1000)]
     buf = io.BytesIO()
     clip.export(buf, format="ogg", codec="libopus", bitrate="48k")
     return buf.getvalue()
 
 
-def detect_songs_in_chunk(chunk: Chunk, audio_path: str, client, model: str,
+def detect_songs_in_chunk(chunk: Chunk, audio, client, model: str,
                           thinking_level: str = "MEDIUM") -> list[int]:
-    """One Gemini call: return the sung subtitle IDs in this chunk."""
-    audio_bytes = slice_audio_opus(audio_path, chunk.offset_s, chunk.end_s)
+    """One Gemini call: return the sung subtitle IDs in this chunk. `audio` is a
+    file path or a preloaded mono AudioSegment."""
+    audio_bytes = slice_audio_opus(audio, chunk.offset_s, chunk.end_s)
     script = build_chunk_script(chunk)
     prompt = (
         "Here is the subtitle script for this audio slice "
@@ -189,10 +192,11 @@ def detect_songs(audio_path: str, subtitles_path: str, client, model: str,
         return []
     chunks = chunk_subs(subs, target_min=target_min,
                         min_split_min=min_split_min, gap_min_s=gap_min_s)
+    seg = AudioSegment.from_file(audio_path).set_channels(1)  # decode once
     sung: set[int] = set()
     with ThreadPoolExecutor(max_workers=max(1, len(chunks))) as pool:
         results = pool.map(
-            lambda c: detect_songs_in_chunk(c, audio_path, client, model,
+            lambda c: detect_songs_in_chunk(c, seg, client, model,
                                             thinking_level),
             chunks)
         for r in results:

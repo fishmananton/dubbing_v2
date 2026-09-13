@@ -211,10 +211,12 @@ def main() -> None:
     print(f"subs: {os.path.basename(subs_path)}")
 
     import srt as _srt
+    from pydub import AudioSegment
     from song_detect import chunk_subs, build_chunk_script, slice_audio_opus
 
     subs = list(_srt.parse(open(subs_path, encoding="utf-8").read()))
     chunks = chunk_subs(subs)
+    seg = AudioSegment.from_file(audio_path).set_channels(1)  # decode once
     print(f"audio: {len(chunks)} chunk(s)")
 
     api_key = os.getenv("GEMINI_API_KEY")
@@ -225,7 +227,7 @@ def main() -> None:
     all_issues: list[Issue] = []
     for ci, chunk in enumerate(chunks):
         chunk_script = build_chunk_script(chunk)
-        audio_bytes = slice_audio_opus(audio_path, chunk.offset_s, chunk.end_s)
+        audio_bytes = slice_audio_opus(seg, chunk.offset_s, chunk.end_s)
         print(f"  chunk {ci+1}/{len(chunks)}: {len(audio_bytes)/1e6:.2f} MB opus")
         issues = qc_check(
             audio_bytes=audio_bytes,
