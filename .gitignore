@@ -16,3 +16,6 @@ tmp/
 *.log
 *.sqlite3
 config/permanent_voices.json
+
+# git worktrees
+.worktrees/
