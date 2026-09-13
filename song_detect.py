@@ -11,16 +11,13 @@ from __future__ import annotations
 
 import io
 import json
-import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
 
 import srt
 from google import genai
 from pydub import AudioSegment
-
-from test_dub_qc import build_script, compress_audio
 
 
 @dataclass
