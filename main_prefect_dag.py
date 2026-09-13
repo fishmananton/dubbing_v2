@@ -44,7 +44,7 @@ from qc_evidence import build_evidence_bundle
 from qc_fixes import apply_fixes, load_playbook, resolve_collisions
 from song_detect import detect_songs, drop_sub_ids
 from qc_tail import (append_promotion_queue, build_fix_log, diff_reqc,
-                     split_auto_and_proposals, write_fix_log)
+                     split_auto_and_proposals, write_fix_log, write_qc_issues)
 from test_dub_qc import build_script, compress_audio, qc_check as qc_listen_check
 from final_audio import build_audio, measure_loudness
 from prefect.cache_policies import NO_CACHE
@@ -230,6 +230,65 @@ def t_retranslate_timing_fix(config, overflow_requests, underflow_requests, targ
             model=config.timing_retranslate_model,
         )
     return result
+
+
+@task(cache_policy=NO_CACHE)
+def t_qc_listen_check(subtitles_file, audio_file, label="QC listen check"):
+    with timer(label):
+        from google import genai
+        script = build_script(subtitles_file)
+        audio_bytes = compress_audio(audio_file)
+        gclient = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        gmodel = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        return qc_listen_check(audio_bytes=audio_bytes, script=script,
+                               client=gclient, model=gmodel)
+
+
+@task(cache_policy=NO_CACHE)
+def t_qc_decide(issues, bundle, playbook, audio_file):
+    with timer("QC decide"):
+        from google import genai
+        from pydub import AudioSegment
+        from song_detect import slice_audio_opus
+        gclient = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        gmodel = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+
+        def _model_call(system, contents, response_schema):
+            # contents is a plain prompt string (phase 1) or a list whose first item
+            # is the prompt and whose remaining items are raw opus bytes (phase 2).
+            if isinstance(contents, list):
+                parts = []
+                for c in contents:
+                    if isinstance(c, (bytes, bytearray)):
+                        parts.append(genai.types.Part.from_bytes(
+                            data=bytes(c), mime_type="audio/ogg"))
+                    else:
+                        parts.append(c)
+                wire = [system, *parts]
+            else:
+                wire = [system, contents]
+            r = gclient.models.generate_content(
+                model=gmodel, contents=wire,
+                config=genai.types.GenerateContentConfig(
+                    response_mime_type="application/json"))
+            return json.loads(r.text)
+
+        # Decode the final audio once; slice the model-requested [start,end] windows.
+        seg = AudioSegment.from_file(audio_file).set_channels(1)
+
+        def _audio_provider(reqs):
+            clips = {}
+            for req in reqs:
+                idx = req.get("idx")
+                window = req.get("window") or []
+                if idx is None or len(window) != 2:
+                    continue
+                start_s, end_s = float(window[0]), float(window[1])
+                clips[idx] = slice_audio_opus(seg, start_s, end_s)
+            return clips
+
+        return qc_decide(issues, bundle, playbook, model_call=_model_call,
+                         audio_provider=_audio_provider)
 
 
 
@@ -1062,16 +1121,11 @@ def dubbing_flow(
             write_fix_log({"summary": {"skipped": "unsupported_ttsmodel"},
                            "decisions": [], "proposals": []}, qc_log_path)
         else:
+            qc_issues_path = os.path.join(config.data_output_folder, "qc_issues.json")
             try:
-                from google import genai
-                subs_for_qc = subtitles_for_combine
-                script = build_script(subs_for_qc)
-                audio_bytes = compress_audio(config.audio_result_file)
-                gclient = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-                gmodel = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-
-                issues = qc_listen_check(audio_bytes=audio_bytes, script=script,
-                                         client=gclient, model=gmodel)
+                issues = t_qc_listen_check.submit(
+                    subtitles_for_combine, config.audio_result_file).result()
+                write_qc_issues(issues, qc_issues_path)
 
                 if not issues:                                   # zero-issue path
                     write_fix_log(build_fix_log([], [], reqc_count=0), qc_log_path)
@@ -1079,16 +1133,9 @@ def dubbing_flow(
                     bundle = build_evidence_bundle(issues, config)
                     playbook = load_playbook("config/qc_playbook.json")
 
-                    def _model_call(system, contents, response_schema):
-                        r = gclient.models.generate_content(
-                            model=gmodel,
-                            contents=[system, contents],
-                            config=genai.types.GenerateContentConfig(
-                                response_mime_type="application/json"))
-                        return json.loads(r.text)
-
-                    decisions = qc_decide(issues, bundle, playbook,
-                                          model_call=_model_call)
+                    decisions = t_qc_decide.submit(
+                        issues, bundle, playbook,
+                        config.audio_result_file).result()
                     auto, proposals = split_auto_and_proposals(decisions)
 
                     if not auto:                                 # all proposals -> no regen
@@ -1114,11 +1161,13 @@ def dubbing_flow(
                             use_non_speech=use_non_speech, video_file=video_file,
                             changed_list=changed, qc_fix=True)
 
-                        reqc_audio = compress_audio(config.audio_result_file)
-                        reqc_script = build_script(config.subtitles_retranslated_file)
-                        reqc_issues = qc_listen_check(audio_bytes=reqc_audio,
-                                                      script=reqc_script, client=gclient,
-                                                      model=gmodel)
+                        reqc_issues = t_qc_listen_check.submit(
+                            config.subtitles_retranslated_file,
+                            config.audio_result_file, label="QC re-check").result()
+                        write_qc_issues(
+                            reqc_issues,
+                            os.path.join(config.data_output_folder,
+                                         "qc_issues_reqc.json"))
                         diff_reqc(auto, issues, reqc_issues)
                         append_promotion_queue(
                             auto, "config/qc_promotion_queue.json")
@@ -1134,8 +1183,11 @@ def dubbing_flow(
                                "proposals": []}, qc_log_path)
 
         with timer("Move output to storagebox"):
-            if local_dir.exists():
-                shutil.move(str(local_dir), str(Path("/mnt/storagebox") / "output" / run_id))
+            storagebox = Path("/mnt/storagebox")
+            if local_dir.exists() and storagebox.is_dir():
+                shutil.move(str(local_dir), str(storagebox / "output" / run_id))
+            elif not storagebox.is_dir():
+                print(f"ℹ️  /mnt/storagebox not mounted; leaving output at {local_dir}")
 
 
 def generate_run_id():
@@ -1166,4 +1218,4 @@ if __name__ == "__main__":
                  # test_duration_sec=120,
                  is_dubbed=False,
                  use_non_speech=True,
-                 stage = STAGES.SPLIT.value)
+                 stage = STAGES.COMBINE.value)

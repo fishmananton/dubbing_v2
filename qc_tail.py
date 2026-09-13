@@ -68,6 +68,25 @@ def write_fix_log(log: dict, path: str) -> None:
         json.dump(log, f, indent=2, ensure_ascii=False)
 
 
+def write_qc_issues(issues, path: str) -> None:
+    """Persist the raw issues QC reported (symptom/mismatch/severity/window), so a
+    human can see exactly what the listen pass heard — independent of what the agent
+    later did with them. `issues` are test_dub_qc.Issue objects (severity is an enum)."""
+    def ser(i):
+        sev = getattr(i, "severity", None)
+        return {
+            "sub_index": i.sub_index,
+            "start": i.start,
+            "end": i.end,
+            "symptom": i.symptom,
+            "mismatch": i.mismatch,
+            "severity": getattr(sev, "value", sev),
+        }
+    out = {"count": len(issues), "issues": [ser(i) for i in issues]}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+
+
 def split_auto_and_proposals(decisions: list[Decision]):
     auto = [d for d in decisions if d.auto_apply]
     proposals = [d for d in decisions if not d.auto_apply]

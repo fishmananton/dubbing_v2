@@ -116,6 +116,30 @@ def test_edit_text_rewrites_keeping_speaker(tmp_path):
     assert _read_subs(srt_path)[1].content == "SPEAKER_00: at 8:45"
 
 
+def test_edit_text_strips_duplicate_speaker_prefix(tmp_path):
+    # The model sometimes returns new_text WITH the speaker prefix already on it
+    # (e.g. "Paulo: ..."). The writer must not double it into "Paulo: Paulo: ...",
+    # which regen would then speak aloud. Real taxi_CUT_03 idx-102 regression.
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(1, 0, 2, "Paulo: старый текст")])
+    d = make(1, "edit_text", 0.9, new_text="Paulo: новый текст")
+    d.auto_apply = True
+    apply_fixes([d], subtitles_file=str(srt_path),
+                emotions_file=str(tmp_path / "emo.json"))
+    assert _read_subs(srt_path)[1].content == "Paulo: новый текст"
+
+
+def test_edit_text_strips_prefix_only_when_it_matches_speaker(tmp_path):
+    # A colon inside genuine dialogue (different from the speaker label) must survive.
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(1, 0, 2, "SPEAKER_00: old")])
+    d = make(1, "edit_text", 0.9, new_text="he said: run")
+    d.auto_apply = True
+    apply_fixes([d], subtitles_file=str(srt_path),
+                emotions_file=str(tmp_path / "emo.json"))
+    assert _read_subs(srt_path)[1].content == "SPEAKER_00: he said: run"
+
+
 def test_drop_line_removes_line(tmp_path):
     srt_path = tmp_path / "retrans.srt"
     _write_srt(srt_path, [(1, 0, 2, "SPEAKER_00: hi"),

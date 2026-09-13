@@ -11,7 +11,9 @@ receive the QC symptom plus a deterministic evidence bundle (text layers, diariz
 spans, original-vocal energy, a precomputed long-activity/short-text mismatch signal, \
 emotion tag, timing/fit row). Reason from evidence to exactly one primitive per issue:
 
-- edit_text {new_text}: fix wording/normalization (numbers, units, times).
+- edit_text {new_text}: fix wording/normalization (numbers, units, times). new_text is \
+the SPOKEN words only — never include the "Speaker:" label prefix (it is preserved \
+automatically). To change who speaks, use change_speaker instead.
 - drop_line {}: remove an invented line (STT hallucination on non-speech, e.g. a scream \
 transcribed as words — look for long_activity_short_text).
 - set_emotion {tag, category, vector}: fix a clearly wrong emotion.
@@ -166,11 +168,18 @@ def decide(issues, bundle, playbook,
         if audio_reqs and audio_provider is not None:
             clips = audio_provider(audio_reqs)  # {idx: opus_bytes}
             phase2_prompt = json.dumps({
-                "resolve_with_audio": [r["needs_audio"] for r in raws.values()
-                                       if r.get("needs_audio")],
-                "note": "audio clips attached separately; finalize these issues",
+                "resolve_with_audio": audio_reqs,
+                "note": "audio clips for each idx are attached below, in the same "
+                        "order; listen and finalize these issues",
             }, default=str)
-            phase2 = model_call(AGENT_SYSTEM_PROMPT, phase2_prompt, None)
+            # Forward as a contents list: the prompt text, then one audio-bytes clip
+            # per requested idx. model_call wraps raw bytes into audio Parts.
+            contents = [phase2_prompt]
+            for req in audio_reqs:
+                clip = clips.get(req.get("idx"))
+                if clip:
+                    contents.append(clip)
+            phase2 = model_call(AGENT_SYSTEM_PROMPT, contents, None)
             for r in _decisions_from_response(phase2):
                 raws[_raw_idx(r)] = r  # phase-2 answer overrides the pending one
 

@@ -1,3 +1,5 @@
+import json
+
 from qc_agent import decide, RawDecision
 
 
@@ -106,9 +108,11 @@ def test_propose_on_hallucination_evidence_promoted_to_drop_line():
 
 def test_phase2_invoked_when_audio_requested():
     calls = {"n": 0}
+    seen = {}
 
     def two_phase(system, contents, response_schema):
         calls["n"] += 1
+        seen[calls["n"]] = contents
         if calls["n"] == 1:
             return {"decisions": [{"idx": 4, "primitive": "pending",
                                    "confidence": 0.0, "diagnosis": "",
@@ -121,8 +125,27 @@ def test_phase2_invoked_when_audio_requested():
     decisions = decide([Issue(4)], _bundle(4), [], model_call=two_phase,
                        audio_provider=lambda reqs: {4: b"opusbytes"})
     assert calls["n"] == 2
+    # phase-1 contents is a plain string prompt; phase-2 must forward the audio bytes
+    assert isinstance(seen[1], str)
+    assert isinstance(seen[2], list)
+    assert b"opusbytes" in seen[2]
     assert decisions[0].primitive == "drop_line"
     assert decisions[0].auto_apply is True
+
+
+def test_phase2_skipped_when_no_provider_leaves_pending_as_propose():
+    # needs_audio but no provider wired -> phase 2 can't run -> the pending decision
+    # (no primitive) degrades to a propose with empty params. This is the taxi_CUT_03
+    # symptom: high-confidence-but-empty proposals that never auto-applied.
+    def one_phase(system, contents, response_schema):
+        return {"decisions": [{"idx": 4, "confidence": 0.92, "diagnosis": "",
+                               "params": {},
+                               "needs_audio": {"idx": 4, "window": [1.0, 3.0]}}]}
+
+    bundle = {4: {"mismatch_signal": {"long_activity_short_text": False}}}
+    decisions = decide([Issue(4)], bundle, [], model_call=one_phase)
+    assert decisions[0].primitive == "propose"
+    assert decisions[0].auto_apply is False
 
 
 def test_model_failure_yields_all_proposals():
@@ -191,6 +214,34 @@ def test_diff_fixed_when_issue_gone():
     outcomes = {d.idx: d.outcome for d in applied}
     assert outcomes[1] == "fixed"
     assert outcomes[2] == "regression"
+
+
+def test_write_qc_issues_persists_symptoms(tmp_path):
+    from qc_tail import write_qc_issues
+    from test_dub_qc import Issue, Severity
+    issues = [
+        Issue(start=1.0, end=2.5, sub_index=57, symptom="flat delivery",
+              mismatch="line calls for feeling", severity=Severity.medium),
+        Issue(start=3.0, end=4.0, sub_index=None, symptom="click",
+              mismatch="artifact", severity=Severity.low),
+    ]
+    p = tmp_path / "qc_issues.json"
+    write_qc_issues(issues, str(p))
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["count"] == 2
+    assert data["issues"][0]["sub_index"] == 57
+    assert data["issues"][0]["symptom"] == "flat delivery"
+    assert data["issues"][0]["severity"] == "medium"
+    assert data["issues"][1]["sub_index"] is None
+
+
+def test_write_qc_issues_empty(tmp_path):
+    from qc_tail import write_qc_issues
+    p = tmp_path / "qc_issues.json"
+    write_qc_issues([], str(p))
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["count"] == 0
+    assert data["issues"] == []
 
 
 def test_build_fix_log_shape():

@@ -435,7 +435,14 @@ def apply_retranslation(
     for sub in subs:
         if sub.index == idx:
             speaker = sub.content.split(":", 1)[0].strip() if ":" in sub.content else ""
-            sub.content = f"{speaker}: {new_text}" if speaker else new_text
+            text = new_text.strip()
+            # The model sometimes echoes the speaker label into new_text
+            # ("Paulo: ..."). Strip it so we don't double the prefix ("Paulo: Paulo:
+            # ..."), which regen would speak aloud. Only strip when the leading label
+            # equals this line's speaker — a genuine "he said:" in dialogue survives.
+            if speaker and text.split(":", 1)[0].strip() == speaker:
+                text = text.split(":", 1)[1].strip()
+            sub.content = f"{speaker}: {text}" if speaker else text
             break
     else:
         return []
