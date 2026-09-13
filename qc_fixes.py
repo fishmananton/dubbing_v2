@@ -188,3 +188,23 @@ def apply_fixes(decisions: list[Decision], subtitles_file: str,
             changed += _set_emotion(d.idx, prm["tag"], prm["category"],
                                     prm["vector"], emotions_file)
     return sorted(set(changed))
+
+
+def load_playbook(path: str = "config/qc_playbook.json") -> list[dict]:
+    return _load_playbook_json(path)
+
+
+def _load_playbook_json(path: str) -> list[dict]:
+    try:
+        return json.loads(open(path, encoding="utf-8").read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def match_playbook(entries: list[dict], primitive: str) -> float:
+    """Return the max confidence_boost among entries whose primitive matches.
+    The agent supplies the human-readable pattern match; this rewards alignment
+    of the chosen primitive with a known pattern."""
+    boosts = [float(e.get("confidence_boost", 0.0))
+              for e in entries if e.get("primitive") == primitive]
+    return max(boosts) if boosts else 0.0

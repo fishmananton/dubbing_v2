@@ -175,3 +175,23 @@ def test_only_auto_apply_decisions_are_written(tmp_path):
                           emotions_file=str(tmp_path / "emo.json"))
     assert changed == []
     assert _read_subs(srt_path)[1].content == "SPEAKER_00: original"
+
+
+from qc_fixes import load_playbook, match_playbook
+
+
+def test_load_playbook_reads_entries():
+    entries = load_playbook("config/qc_playbook.json")
+    assert len(entries) >= 3
+    assert all("pattern" in e and "primitive" in e for e in entries)
+
+
+def test_match_playbook_missing_file_returns_empty(tmp_path):
+    assert load_playbook(str(tmp_path / "nope.json")) == []
+
+
+def test_match_playbook_by_primitive():
+    entries = [{"pattern": "p", "primitive": "drop_line", "confidence_boost": 0.1}]
+    boost = match_playbook(entries, "drop_line")
+    assert boost == 0.1
+    assert match_playbook(entries, "edit_text") == 0.0

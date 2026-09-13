@@ -1,0 +1,20 @@
+[
+  {
+    "pattern": "Long continuous original-vocal activity (scream/laugh) but few or no words in the transcript — STT hallucination on non-speech.",
+    "primitive": "drop_line",
+    "guidance": "Drop the invented line so the original non-speech vocal is revealed by the non-speech layer.",
+    "confidence_boost": 0.10
+  },
+  {
+    "pattern": "Numbers/times/units read out as words or mis-normalized (e.g. 'eight forty five' vs '8:45', '$' vs 'dollars').",
+    "primitive": "edit_text",
+    "guidance": "Rewrite the text with the correct normalized form; keep the speaker prefix.",
+    "confidence_boost": 0.10
+  },
+  {
+    "pattern": "Emotion of the dubbed line clearly wrong vs. what the scene requires (flat where it should be angry, etc.).",
+    "primitive": "set_emotion",
+    "guidance": "Overwrite the line's emotion tag/category/vector.",
+    "confidence_boost": 0.05
+  }
+]
