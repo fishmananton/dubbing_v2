@@ -39,6 +39,12 @@ from transcribe_common import assemble_transcription
 from loudness_adjust import run_line_loudness_stage
 from detect_mouth_windows import detect_mouth_windows
 from test_results import qc_check
+from qc_agent import decide as qc_decide
+from qc_evidence import build_evidence_bundle
+from qc_fixes import apply_fixes, load_playbook, resolve_collisions
+from qc_tail import (append_promotion_queue, build_fix_log, diff_reqc,
+                     split_auto_and_proposals, write_fix_log)
+from test_dub_qc import build_script, compress_audio, qc_check as qc_listen_check
 from final_audio import build_audio, measure_loudness
 from prefect.cache_policies import NO_CACHE
 from tts_inworld import tts_generate_multivoice_inworld_segments
@@ -1005,6 +1011,80 @@ def dubbing_flow(
         data = json.loads(path.read_text()) if path.exists() else {}
         data["output_file"] = output_file
         path.write_text(json.dumps(data, indent=4))
+
+        # ---------------- post-COMBINE QC-fix tail (same flow run) ----------------
+        qc_log_path = os.path.join(config.data_output_folder, "qc_fix_log.json")
+        try:
+            from google import genai
+            subs_for_qc = subtitles_for_combine
+            script = build_script(subs_for_qc)
+            audio_bytes = compress_audio(config.audio_result_file)
+            gclient = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+            gmodel = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+
+            issues = qc_listen_check(audio_bytes=audio_bytes, script=script,
+                                     client=gclient, model=gmodel)
+
+            if not issues:                                   # zero-issue path
+                write_fix_log(build_fix_log([], [], reqc_count=0), qc_log_path)
+            else:
+                bundle = build_evidence_bundle(issues, config)
+                playbook = load_playbook("config/qc_playbook.json")
+
+                def _model_call(system, contents, response_schema):
+                    r = gclient.models.generate_content(
+                        model=gmodel,
+                        contents=[system, contents],
+                        config=genai.types.GenerateContentConfig(
+                            response_mime_type="application/json"))
+                    return json.loads(r.text)
+
+                decisions = qc_decide(issues, bundle, playbook,
+                                      model_call=_model_call)
+                auto, proposals = split_auto_and_proposals(decisions)
+
+                if not auto:                                 # all proposals -> no regen
+                    write_fix_log(build_fix_log([], proposals, reqc_count=0),
+                                  qc_log_path)
+                else:
+                    auto = resolve_collisions(auto)          # dedupe by idx FIRST
+                    proposals += [d for d in decisions
+                                  if not d.auto_apply and d not in proposals]
+                    changed = apply_fixes(
+                        auto, subtitles_file=config.subtitles_retranslated_file,
+                        emotions_file=config.emotions_tags_file)
+
+                    _regen_and_combine(
+                        config=config, speakers_array=speakers_array,
+                        emotions_tags=emotions_tags,
+                        subtitle_visibility_analysis=subtitle_visibility_analysis,
+                        dst_language=dst_language, ttsmodel=ttsmodel,
+                        speaker_base_atempo=speaker_base_atempo,
+                        timing_overflow_threshold=timing_overflow_threshold,
+                        timing_max_speed_factor=timing_max_speed_factor,
+                        is_dubbed=is_dubbed, mix_gains=mix_gains,
+                        use_non_speech=use_non_speech, video_file=video_file,
+                        changed_list=changed, qc_fix=True)
+
+                    reqc_audio = compress_audio(config.audio_result_file)
+                    reqc_script = build_script(config.subtitles_retranslated_file)
+                    reqc_issues = qc_listen_check(audio_bytes=reqc_audio,
+                                                  script=reqc_script, client=gclient,
+                                                  model=gmodel)
+                    diff_reqc(auto, issues, reqc_issues)
+                    append_promotion_queue(
+                        auto, "config/qc_promotion_queue.json")
+                    write_fix_log(build_fix_log(auto, proposals, reqc_count=1),
+                                  qc_log_path)
+                    # Re-render video from the pass-2 audio.
+                    output_file = t_generate_videos.submit(
+                        config, video_file, config.audio_result_file,
+                        preview=False).result()
+        except Exception as e:  # noqa: BLE001 — QC-fix must never fail the dub
+            print(f"⚠️  QC-fix tail failed ({e}); shipping render pass 1")
+            write_fix_log({"summary": {"error": str(e)}, "decisions": [],
+                           "proposals": []}, qc_log_path)
+
         with timer("Move output to storagebox"):
             if local_dir.exists():
                 shutil.move(str(local_dir), str(Path("/mnt/storagebox") / "output" / run_id))

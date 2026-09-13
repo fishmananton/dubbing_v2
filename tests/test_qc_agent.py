@@ -116,3 +116,44 @@ def test_qc_check_is_importable_and_unions_passes(monkeypatch):
     assert calls["n"] == 3
     assert len(issues) == 1  # 3 identical passes union down to one
     assert issues[0].sub_index == 7
+
+
+from qc_tail import diff_reqc, build_fix_log
+
+
+class Iss:
+    def __init__(self, sub_index):
+        self.sub_index = sub_index
+        self.start, self.end = 0.0, 1.0
+        self.symptom, self.mismatch = "s", "m"
+        from test_dub_qc import Severity
+        self.severity = Severity.high
+
+
+def test_diff_fixed_when_issue_gone():
+    from qc_fixes import Decision
+    before = [Iss(1), Iss(2)]
+    after = [Iss(2)]  # idx1 cleared, idx2 remains
+    applied = [Decision(idx=1, primitive="drop_line", confidence=0.95),
+               Decision(idx=2, primitive="edit_text", confidence=0.9)]
+    for d in applied:
+        d.auto_apply = True
+    diff_reqc(applied, before, after)
+    outcomes = {d.idx: d.outcome for d in applied}
+    assert outcomes[1] == "fixed"
+    assert outcomes[2] == "regression"
+
+
+def test_build_fix_log_shape():
+    from qc_fixes import Decision
+    fixed = Decision(idx=1, primitive="drop_line", confidence=0.95,
+                     diagnosis="scream")
+    fixed.auto_apply = True
+    fixed.outcome = "fixed"
+    proposal = Decision(idx=3, primitive="propose", confidence=0.4,
+                        params={"suggested_fix": "human"}, diagnosis="unclear")
+    log = build_fix_log([fixed], [proposal], reqc_count=1)
+    assert log["summary"]["auto_applied"] == 1
+    assert log["summary"]["proposals"] == 1
+    assert log["decisions"][0]["idx"] == 1
+    assert log["proposals"][0]["idx"] == 3
