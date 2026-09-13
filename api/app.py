@@ -135,9 +135,8 @@ FINAL_STAGE_MAP = {
     },
     "TRANSCRIBE": {
         "t_process_video_with_subs",
-        "t_alibabacloud_transcribe",
-        "t_assemblyai_transcribe",
-        "t_whisper_transcribe",
+        "t_transcribe_raw",
+        "t_assemble_transcription",
     },
     "TRANSLATE": {
         "t_translate",

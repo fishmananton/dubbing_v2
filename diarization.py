@@ -9,6 +9,11 @@ from scipy.spatial.distance import cosine
 import soundfile as sf
 
 
+# When True, trust pyannote's raw speaker labels directly and skip ECAPA
+# re-clustering (assign_voice_identities). Set False to restore the old path.
+USE_PYANNOTE_RAW = True
+
+
 def diarize (boto_session: boto3.Session, pyannote_key, bucket_name: str,  audio_path: str, num_speakers = None, run_id:str=''):
 
     if num_speakers == 1:
@@ -81,7 +86,7 @@ def diarize (boto_session: boto3.Session, pyannote_key, bucket_name: str,  audio
     calculated_speakers = len(set(seg["speaker_raw"] for seg in speaker_segments))
     if num_speakers is None and calculated_speakers <= 2:
         num_speakers = calculated_speakers
-    if num_speakers is None:
+    if num_speakers is None and not USE_PYANNOTE_RAW:
         speaker_segments = assign_voice_identities(audio_path, speaker_segments)
     else:
         for seg in speaker_segments: seg["speaker"] = seg["speaker_raw"]

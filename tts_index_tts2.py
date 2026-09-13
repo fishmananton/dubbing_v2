@@ -62,6 +62,25 @@ COLD_BOOT_S = 75
 CHARS_PER_SEC_PER_GPU = 8.5
 TARGET_POD_SECONDS = 150
 
+# Phonation styles the 8-dim emo_vector cannot represent. Detected from the
+# free-text emotion_tag; when matched, the line is driven by a reference clip
+# (emo_audio_prompt) instead of the vector. First match wins, so order matters.
+PHONATION_PATTERNS = [
+    ("whisper", re.compile(r"whisper|hushed", re.IGNORECASE)),
+    ("shout", re.compile(r"shout|yell|scream|holler", re.IGNORECASE)),
+    ("cry", re.compile(r"\bcry|crying|sobbing|sobs|weeping|tearful", re.IGNORECASE)),
+]
+
+
+def _detect_phonation_style(emotion_tag: str | None) -> str | None:
+    """Return 'whisper' | 'shout' | 'cry' if the tag names that style, else None."""
+    if not emotion_tag:
+        return None
+    for style, pat in PHONATION_PATTERNS:
+        if pat.search(emotion_tag):
+            return style
+    return None
+
 
 def _normalize_for_dedup(text: str) -> str:
     """Strip punctuation and lowercase for duplicate comparison."""
@@ -257,8 +276,10 @@ def tts_generate_index_tts2_segments(
             tag_data = emotions_tags.get(idx) or emotions_tags.get(str(idx))
             if tag_data and isinstance(tag_data, dict):
                 emo_vector = tag_data.get("emo_vector", [0.0] * 8)
+                phonation_style = _detect_phonation_style(tag_data.get("emotion_tag"))
             else:
                 emo_vector = [0.0] * 8
+                phonation_style = None
 
             if duration_factors and idx in duration_factors:
                 duration_factor = duration_factors[idx]
@@ -277,6 +298,7 @@ def tts_generate_index_tts2_segments(
                         "idx": idx * 1000 + vi,
                         "text": _strip_pause_punctuation(_normalize_for_tts(variant_text)),
                         "emo_vector": emo_vector,
+                        "phonation_style": phonation_style,
                         "duration_factor": duration_factor,
                         "duration_sec": duration_sec,
                         "_real_idx": idx,
@@ -290,6 +312,7 @@ def tts_generate_index_tts2_segments(
                     "idx": idx,
                     "text": text,
                     "emo_vector": emo_vector,
+                    "phonation_style": phonation_style,
                     "duration_factor": duration_factor,
                     "duration_sec": duration_sec,
                 })

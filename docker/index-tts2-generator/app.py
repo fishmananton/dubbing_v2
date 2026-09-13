@@ -6,6 +6,15 @@ app = modal.App("index-tts-2-5-generator")
 SILENT_TOKEN = 52
 MAX_CONSECUTIVE_SILENCE = 2
 
+# Phonation styles driven by a reference clip instead of the 8-dim emo_vector.
+# Paths are where the refs land inside the image (see add_local_dir below).
+EMO_REF_DIR = "/emo_refs"
+PHONATION_REFS = {
+    "whisper": (f"{EMO_REF_DIR}/whisper.wav", 0.8),
+    "shout": (f"{EMO_REF_DIR}/shout.wav", 1.0),
+    "cry": (f"{EMO_REF_DIR}/cry.wav", 0.8),
+}
+
 
 # ------------------------------------------------------------------------
 # 0. MONKEY-PATCH: strip mid-utterance silence from GPT codes
@@ -137,6 +146,11 @@ image = (
     # .run_commands("sed -i 's/diffusion_steps = 25/diffusion_steps = 15/' /usr/local/lib/python3.11/site-packages/indextts/infer_v2_5.py")
     .run_function(download_indextts2_5_weights)
     .run_function(prewarm_indextts2_5_cache)
+    .add_local_dir(
+        os.path.join(os.path.dirname(__file__), "emo_refs"),
+        remote_path=EMO_REF_DIR,
+        copy=True,
+    )
 )
 
 
@@ -187,12 +201,24 @@ class IndexTTSGenerator:
                 spk_path = ref_paths[sub["speaker"]]
                 lang = sub.get("lang", "EN")
 
+                # Phonation styles (whisper/shout/cry) are driven by a reference
+                # clip, not the 8-dim vector. emo_vector MUST be None or the model
+                # discards emo_audio_prompt (infer_v2_5.py: "if emo_vector is not None").
+                style = sub.get("phonation_style")
+                ref = PHONATION_REFS.get(style) if style else None
+                if ref:
+                    emo_audio_prompt, emo_alpha, emo_vector = ref[0], ref[1], None
+                else:
+                    emo_audio_prompt, emo_alpha, emo_vector = None, 1.0, sub.get("emo_vector")
+
                 try:
                     self.tts.infer(
                         spk_audio_prompt=spk_path,
                         text=sub["text"],
                         lang=lang,
-                        emo_vector=sub.get("emo_vector"),
+                        emo_audio_prompt=emo_audio_prompt,
+                        emo_alpha=emo_alpha,
+                        emo_vector=emo_vector,
                         duration_factor=sub.get("duration_factor", 1.0),
                         output_path=out_path,
                         use_random=False,

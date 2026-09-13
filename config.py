@@ -66,6 +66,7 @@ class Configuration:
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         self.anthropic_translate_pass1_model = "claude-sonnet-5"  # pass1: batch draft
         self.anthropic_translate_pass2_model = "claude-opus-5"    # pass2: targeted reroll
+        self.timing_retranslate_model = "gpt-4o"                  # overflow/underflow timing reshape
 
         self.tts_model = 'tts-1-hd'
 
