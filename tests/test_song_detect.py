@@ -49,3 +49,19 @@ def test_no_qualifying_gap_allows_oversized_chunk():
     assert len(chunks) == 2
     assert chunks[0].subs[-1].end.total_seconds() <= 1081
     assert chunks[1].offset_s > 1080
+
+
+from song_detect import build_chunk_script
+
+
+def test_build_chunk_script_rebases_times_keeps_ids():
+    subs = [_sub(41, 605, 607, "hello"), _sub(42, 610, 612, "world")]
+    chunk = Chunk(subs=subs, offset_s=600.0, end_s=612.0)
+    script = build_chunk_script(chunk)
+    # original IDs preserved
+    assert "[41]" in script and "[42]" in script
+    # times rebased by -600s: 605->5.00, 610->10.00
+    assert "5.00-7.00" in script
+    assert "10.00-12.00" in script
+    # no absolute 605/610 leaked
+    assert "605" not in script and "610" not in script

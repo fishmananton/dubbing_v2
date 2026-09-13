@@ -13,6 +13,7 @@ import io
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 import srt
 from pydub import AudioSegment
@@ -75,3 +76,23 @@ def chunk_subs(subs: list, target_min: float = 10.0,
         chunks.append(Chunk(subs=cur, offset_s=chunk_start,
                             end_s=subs[-1].end.total_seconds()))
     return chunks
+
+
+def build_chunk_script(chunk: Chunk) -> str:
+    """Indexed script for a chunk with times rebased to the 0-based audio slice.
+    IDs stay original (we delete by original ID). Format matches build_script:
+    '[index] start-end  content'."""
+    rebased = []
+    for s in chunk.subs:
+        rebased.append(srt.Subtitle(
+            index=s.index,
+            start=timedelta(seconds=max(0.0, s.start.total_seconds() - chunk.offset_s)),
+            end=timedelta(seconds=max(0.0, s.end.total_seconds() - chunk.offset_s)),
+            content=s.content,
+        ))
+    lines = []
+    for s in rebased:
+        start = s.start.total_seconds()
+        end = s.end.total_seconds()
+        lines.append(f"[{s.index}] {start:.2f}-{end:.2f}  {s.content}")
+    return "\n".join(lines)
