@@ -1103,12 +1103,20 @@ def dubbing_flow(
             preview_proc.wait()
             if preview_proc.returncode != 0:
                 Path(config.preview_base_video_file).unlink(missing_ok=True)
-        generate_videos_fut = t_generate_videos.submit(config, video_file, audio_result_file, preview=False)
-        output_file = generate_videos_fut.result()
-        path = Path(config.general_config_file)
-        data = json.loads(path.read_text()) if path.exists() else {}
-        data["output_file"] = output_file
-        path.write_text(json.dumps(data, indent=4))
+
+        # Render the pass-1 video concurrently with QC — QC only listens to the audio,
+        # not the video. In the common branches (unsupported engine / no issues / all
+        # proposals) we await this render, hidden behind QC's Gemini call. Only the
+        # auto-fix branch supersedes it; there we await it first so the pass-1 write
+        # can't race the pass-2 render on the same output file.
+        video_fut = t_generate_videos.submit(config, video_file, audio_result_file, preview=False)
+
+        def _finalize_video(output_file):
+            path = Path(config.general_config_file)
+            data = json.loads(path.read_text()) if path.exists() else {}
+            data["output_file"] = output_file
+            path.write_text(json.dumps(data, indent=4))
+            return output_file
 
         # ---------------- post-COMBINE QC-fix tail (same flow run) ----------------
         qc_log_path = os.path.join(config.data_output_folder, "qc_fix_log.json")
@@ -1120,6 +1128,7 @@ def dubbing_flow(
                   f"supported by targeted regen; shipping render pass 1")
             write_fix_log({"summary": {"skipped": "unsupported_ttsmodel"},
                            "decisions": [], "proposals": []}, qc_log_path)
+            output_file = _finalize_video(video_fut.result())
         else:
             qc_issues_path = os.path.join(config.data_output_folder, "qc_issues.json")
             try:
@@ -1129,6 +1138,7 @@ def dubbing_flow(
 
                 if not issues:                                   # zero-issue path
                     write_fix_log(build_fix_log([], [], reqc_count=0), qc_log_path)
+                    output_file = _finalize_video(video_fut.result())
                 else:
                     bundle = build_evidence_bundle(issues, config)
                     playbook = load_playbook("config/qc_playbook.json")
@@ -1141,7 +1151,12 @@ def dubbing_flow(
                     if not auto:                                 # all proposals -> no regen
                         write_fix_log(build_fix_log([], proposals, reqc_count=0),
                                       qc_log_path)
+                        output_file = _finalize_video(video_fut.result())
                     else:
+                        # A fix is coming — the pass-1 video is superseded. Await it
+                        # first so its write completes before the pass-2 render targets
+                        # the same output file (it overlapped QC, so likely already done).
+                        video_fut.result()
                         auto = resolve_collisions(auto)          # dedupe by idx FIRST
                         proposals += [d for d in decisions
                                       if not d.auto_apply and d not in proposals]
@@ -1174,13 +1189,14 @@ def dubbing_flow(
                         write_fix_log(build_fix_log(auto, proposals, reqc_count=1),
                                       qc_log_path)
                         # Re-render video from the pass-2 audio.
-                        output_file = t_generate_videos.submit(
+                        output_file = _finalize_video(t_generate_videos.submit(
                             config, video_file, config.audio_result_file,
-                            preview=False).result()
+                            preview=False).result())
             except Exception as e:  # noqa: BLE001 — QC-fix must never fail the dub
                 print(f"⚠️  QC-fix tail failed ({e}); shipping render pass 1")
                 write_fix_log({"summary": {"error": str(e)}, "decisions": [],
                                "proposals": []}, qc_log_path)
+                output_file = _finalize_video(video_fut.result())
 
         with timer("Move output to storagebox"):
             storagebox = Path("/mnt/storagebox")
