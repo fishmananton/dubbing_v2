@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import random
+import time
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 import srt
 from pydantic import BaseModel, Field
@@ -136,6 +138,30 @@ def compress_audio(wav_path: str) -> bytes:
     return buf.getvalue()
 
 
+# Gemini returns these when it's overloaded or we're rate-limited — transient, worth
+# retrying. Client errors (400/404) are permanent and reraise immediately.
+_TRANSIENT_CODES = {429, 500, 503}
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    return getattr(exc, "code", None) in _TRANSIENT_CODES
+
+
+def _retry_call(fn: Callable[[], object], max_attempts: int = 4,
+                base_delay: float = 1.0,
+                sleep: Callable[[float], None] = time.sleep,
+                jitter: Callable[[], float] = random.random):
+    """Call fn, retrying transient failures with exponential backoff + jitter. Non-
+    transient errors reraise at once; transient ones reraise only after max_attempts."""
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 — reraised below unless retryable
+            if not _is_transient_error(e) or attempt == max_attempts - 1:
+                raise
+            sleep(base_delay * (2 ** attempt) + jitter())
+
+
 def qc_check(
     audio_bytes: bytes,
     script: str,
@@ -144,6 +170,7 @@ def qc_check(
     passes: int = 3,
     temperature: float = 0.4,
     thinking_level: str = "MEDIUM",
+    max_retries: int = 4,
 ) -> list[Issue]:
     """Run `passes` independent Gemini review passes over the compressed audio +
     script and return the deduped union of issues. Shared by the CLI and the
@@ -167,17 +194,32 @@ def qc_check(
     )
 
     def run_pass(p: int) -> list[Issue]:
-        r = client.models.generate_content(
-            model=model, contents=contents, config=gen_config)
+        r = _retry_call(
+            lambda: client.models.generate_content(
+                model=model, contents=contents, config=gen_config),
+            max_attempts=max_retries)
         report = r.parsed
         found = report.issues if report else []
         print(f"pass {p + 1}/{passes}: {len(found)} issue(s)")
         return found
 
+    # QC recall is a union across passes, so a single pass dying (still 503-ing after
+    # retries) shouldn't sink the check — union the survivors. Only raise if every pass
+    # failed, so the caller's outer guard ships pass 1 rather than a partial review.
     all_issues: list[Issue] = []
+    errors: list[Exception] = []
     with ThreadPoolExecutor(max_workers=passes) as pool:
-        for found in pool.map(run_pass, range(passes)):
-            all_issues.extend(found)
+        futures = [pool.submit(run_pass, p) for p in range(passes)]
+        for f in futures:
+            try:
+                all_issues.extend(f.result())
+            except Exception as e:  # noqa: BLE001 — collect; reraise only if all fail
+                errors.append(e)
+    if errors and len(errors) == passes:
+        raise errors[0]
+    if errors:
+        print(f"⚠️  QC: {len(errors)}/{passes} pass(es) failed; "
+              f"using {passes - len(errors)} survivor(s)")
     return dedup_issues(all_issues)
 
 

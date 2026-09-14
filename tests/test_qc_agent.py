@@ -3,6 +3,32 @@ import json
 from qc_agent import decide, RawDecision
 
 
+def test_omitted_confidence_defaults_to_apply_not_bounce():
+    # The model sometimes commits to a concrete primitive with valid params but drops
+    # the `confidence` field entirely (observed on CUT_11 change_timing). A committed
+    # primitive IS the certainty signal, so a missing confidence must default to
+    # auto-apply, not bounce the fix to a proposal. The model can still self-downgrade
+    # by emitting an explicit LOW confidence.
+    raw = [{"idx": 23, "primitive": "change_timing",
+            "diagnosis": "extend box over leaked span",
+            "params": {"new_start_ms": 68145, "new_end_ms": 71145}}]
+    bundle = {23: {"mismatch_signal": {"long_activity_short_text": False}}}
+    decisions = decide([Issue(23)], bundle, [], model_call=fake_model(raw))
+    assert decisions[0].primitive == "change_timing"
+    assert decisions[0].confidence == 1.0
+    assert decisions[0].auto_apply is True
+
+
+def test_explicit_low_confidence_still_bounces():
+    # Omission -> apply, but an EXPLICIT low number still means self-doubt -> bounce.
+    raw = [{"idx": 23, "primitive": "change_timing", "confidence": 0.4,
+            "diagnosis": "unsure", "params": {"new_start_ms": 68145,
+                                              "new_end_ms": 71145}}]
+    bundle = {23: {"mismatch_signal": {"long_activity_short_text": False}}}
+    decisions = decide([Issue(23)], bundle, [], model_call=fake_model(raw))
+    assert decisions[0].auto_apply is False
+
+
 def fake_model(raw_decisions):
     """Return a callable that ignores inputs and yields a fixed phase-1 payload."""
     def _call(system, contents, response_schema):
@@ -104,6 +130,85 @@ def test_propose_on_hallucination_evidence_promoted_to_drop_line():
     decisions = decide([Issue(20)], bundle, playbook, model_call=fake_model(raw))
     assert decisions[0].primitive == "drop_line"
     assert decisions[0].auto_apply is True  # 0.85 + 0.10 = 0.95 >= 0.90
+
+
+def test_multiple_actions_same_line_survive():
+    # French bleed on one line needs BOTH a text fix (adieu->see you) AND a box
+    # extension over the leaked audio. Different fields, so decide() must return both
+    # (today the idx-keyed collapse drops all but the last raw). Collision resolution
+    # keeps different-field edits — that's the orchestrator's job, not decide()'s.
+    raw = [
+        {"idx": 47, "primitive": "edit_text", "confidence": 0.9,
+         "diagnosis": "adieu -> see you", "params": {"new_text": "See you."}},
+        {"idx": 47, "primitive": "change_timing", "confidence": 0.9,
+         "diagnosis": "extend box over bleed",
+         "params": {"new_start_ms": 282225, "new_end_ms": 285000}},
+    ]
+    bundle = {47: {"mismatch_signal": {"long_activity_short_text": False}}}
+    decisions = decide([Issue(47)], bundle, [], model_call=fake_model(raw))
+    prims = sorted(d.primitive for d in decisions if d.idx == 47)
+    assert prims == ["change_timing", "edit_text"]
+    assert all(d.auto_apply for d in decisions)
+
+
+def test_multiple_lines_from_one_issue_all_survive():
+    # A block-level speaker misattribution: the flagged issue is on line 101, but the
+    # fix spans the mislabeled block — reassign 101 & 102 and correct the gender-agreement
+    # text on 103. One issue fans out to three lines; all must reach the gate.
+    raw = [
+        {"idx": 101, "primitive": "change_speaker", "confidence": 0.9,
+         "diagnosis": "female voice on male block", "params": {"new_speaker": "SPEAKER_02"}},
+        {"idx": 102, "primitive": "change_speaker", "confidence": 0.9,
+         "diagnosis": "same block", "params": {"new_speaker": "SPEAKER_02"}},
+        {"idx": 103, "primitive": "edit_text", "confidence": 0.9,
+         "diagnosis": "fix masculine verb agreement", "params": {"new_text": "он сказал"}},
+    ]
+    decisions = decide([Issue(101)], {101: {}}, [], model_call=fake_model(raw))
+    got = {(d.idx, d.primitive) for d in decisions}
+    assert got == {(101, "change_speaker"), (102, "change_speaker"), (103, "edit_text")}
+
+
+def test_edit_text_correction_lifted_from_diagnosis_when_param_missing():
+    # Model chose edit_text and quoted the corrected line in the diagnosis but forgot
+    # to fill new_text. Lift the cue-anchored correction so it can auto-apply instead
+    # of degrading to an empty proposal (real taxi_CUT_03 idx-102 symptom).
+    raw = [{"idx": 102, "primitive": "edit_text", "confidence": 0.95, "params": {},
+            "diagnosis": "TTS synthesized 'Шесть ли'; correct to 'Шествие особенно'."}]
+    bundle = {102: {"mismatch_signal": {"long_activity_short_text": False}}}
+    decisions = decide([Issue(102)], bundle, [], model_call=fake_model(raw))
+    assert decisions[0].params.get("new_text") == "Шествие особенно"
+    assert decisions[0].auto_apply is True
+
+
+def test_edit_text_without_liftable_correction_stays_proposal():
+    # edit_text, no new_text, and no cue-anchored quote in the diagnosis: we must NOT
+    # guess a random quote (wrong text gets spoken aloud). Stays a safe proposal.
+    raw = [{"idx": 5, "primitive": "edit_text", "confidence": 0.95, "params": {},
+            "diagnosis": "The wording sounds off and needs a human relisten."}]
+    bundle = {5: {"mismatch_signal": {"long_activity_short_text": False}}}
+    decisions = decide([Issue(5)], bundle, [], model_call=fake_model(raw))
+    assert decisions[0].auto_apply is False
+    assert "new_text" not in decisions[0].params
+
+
+def test_shared_context_forwarded_to_prompt():
+    # The whole-clip timeline must reach the model in phase 1 so it can reason across
+    # neighboring lines/spans (e.g. diarization onset vs. subtitle box for bleed).
+    seen = {}
+
+    def capture(system, contents, response_schema):
+        seen["prompt"] = contents
+        return {"decisions": [{"idx": 1, "primitive": "propose", "confidence": 0.3,
+                               "diagnosis": "d", "params": {"suggested_fix": "x"}}]}
+
+    ctx = {"diarization": [{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}],
+           "subtitles_retranslated": [{"idx": 1, "start": 0.5, "end": 2.0,
+                                       "text": "S: hi"}]}
+    bundle = {1: {"mismatch_signal": {"long_activity_short_text": False}}}
+    decide([Issue(1)], bundle, [], model_call=capture, context=ctx)
+    payload = json.loads(seen["prompt"])
+    assert payload["timeline"]["diarization"][0]["speaker"] == "SPEAKER_00"
+    assert payload["timeline"]["subtitles_retranslated"][0]["idx"] == 1
 
 
 def test_phase2_invoked_when_audio_requested():

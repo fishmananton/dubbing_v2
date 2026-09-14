@@ -40,12 +40,13 @@ from loudness_adjust import run_line_loudness_stage
 from detect_mouth_windows import detect_mouth_windows
 from test_results import qc_check
 from qc_agent import decide as qc_decide
-from qc_evidence import build_evidence_bundle
+from qc_evidence import build_evidence_bundle, build_shared_context
 from qc_fixes import apply_fixes, load_playbook, resolve_collisions
 from song_detect import detect_songs, drop_sub_ids
 from qc_tail import (append_promotion_queue, build_fix_log, diff_reqc,
                      split_auto_and_proposals, write_fix_log, write_qc_issues)
-from test_dub_qc import build_script, compress_audio, qc_check as qc_listen_check
+from test_dub_qc import (build_script, compress_audio, _retry_call,
+                         qc_check as qc_listen_check)
 from final_audio import build_audio, measure_loudness
 from prefect.cache_policies import NO_CACHE
 from tts_inworld import tts_generate_multivoice_inworld_segments
@@ -245,7 +246,7 @@ def t_qc_listen_check(subtitles_file, audio_file, label="QC listen check"):
 
 
 @task(cache_policy=NO_CACHE)
-def t_qc_decide(issues, bundle, playbook, audio_file):
+def t_qc_decide(issues, bundle, playbook, audio_file, context=None):
     with timer("QC decide"):
         from google import genai
         from pydub import AudioSegment
@@ -267,10 +268,13 @@ def t_qc_decide(issues, bundle, playbook, audio_file):
                 wire = [system, *parts]
             else:
                 wire = [system, contents]
-            r = gclient.models.generate_content(
-                model=gmodel, contents=wire,
-                config=genai.types.GenerateContentConfig(
-                    response_mime_type="application/json"))
+            r = _retry_call(
+                lambda: gclient.models.generate_content(
+                    model=gmodel, contents=wire,
+                    config=genai.types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        thinking_config=genai.types.ThinkingConfig(
+                            thinking_level=genai.types.ThinkingLevel.MEDIUM))))
             return json.loads(r.text)
 
         # Decode the final audio once; slice the model-requested [start,end] windows.
@@ -288,7 +292,7 @@ def t_qc_decide(issues, bundle, playbook, audio_file):
             return clips
 
         return qc_decide(issues, bundle, playbook, model_call=_model_call,
-                         audio_provider=_audio_provider)
+                         audio_provider=_audio_provider, context=context)
 
 
 
@@ -1141,11 +1145,12 @@ def dubbing_flow(
                     output_file = _finalize_video(video_fut.result())
                 else:
                     bundle = build_evidence_bundle(issues, config)
+                    context = build_shared_context(config)
                     playbook = load_playbook("config/qc_playbook.json")
 
                     decisions = t_qc_decide.submit(
                         issues, bundle, playbook,
-                        config.audio_result_file).result()
+                        config.audio_result_file, context=context).result()
                     auto, proposals = split_auto_and_proposals(decisions)
 
                     if not auto:                                 # all proposals -> no regen
@@ -1221,16 +1226,16 @@ def preconfigure():
 # # # === Entry Point ===
 if __name__ == "__main__":
     preconfigure()
-    dubbing_flow("input/taxi_CUT.mp4",
-                 dst_language="ru",
+    dubbing_flow("input/osob_CUT.mp4",
+                 dst_language="en",
                  trans_type='default',
                  emotions_flag=True,
-                 ttsmodel=TTS_MODEL.QWEN3TTS.value,
+                 ttsmodel=TTS_MODEL.INDEXTTS2.value,
                  elevenlabs_emotions=ELEVENLABS_EMOTIONS.HIGH.value,
                  # num_speakers=1,
                  test_mode=False,
                  changed_list=[],
-                 run_id='20260903_taxi_CUT_03',
+                 run_id='20260922_osob_CUT_11',
                  # test_duration_sec=120,
                  is_dubbed=False,
                  use_non_speech=True,

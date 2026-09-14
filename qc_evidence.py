@@ -26,8 +26,8 @@ def diarization_spans_overlapping(diar: list[dict], start: float,
 
 
 def _vocal_energy_stats(vocal_file: str, start: float, end: float) -> dict:
-    """Mean dBFS + active-fraction over [start,end] and a padded window. Degrades to
-    nulls if the file is missing so the bundle is still emitted."""
+    """Mean dBFS over [start,end] and a padded window. Degrades to nulls if the file
+    is missing so the bundle is still emitted."""
     try:
         from pydub import AudioSegment
         seg = AudioSegment.from_file(vocal_file)
@@ -46,7 +46,7 @@ def _vocal_energy_stats(vocal_file: str, start: float, end: float) -> dict:
     }
 
 
-def _mismatch_signal(diar_spans: list[dict], text: str, region_s: float) -> dict:
+def _mismatch_signal(diar_spans: list[dict], text: str) -> dict:
     """Labeled hallucination flag: long continuous vocal activity vs. few words."""
     words = len((text.split(":", 1)[1] if ":" in text else text).split())
     activity_s = sum(s["end"] - s["start"] for s in diar_spans)
@@ -60,24 +60,67 @@ def _mismatch_signal(diar_spans: list[dict], text: str, region_s: float) -> dict
     }
 
 
-def build_evidence_bundle(issues, config) -> dict:
-    """Per flagged issue (keyed by sub_index), gather the deterministic text/numeric
-    evidence. The SRT box is never the sole window — diarization + vocal energy are
-    authoritative (spec Evidence Bundle)."""
+def _subs_rows(path: str) -> list[dict]:
+    """Compact subtitle rows (index, start_s, end_s, content) for the whole clip."""
+    try:
+        subs = list(_srt.parse(open(path, encoding="utf-8").read()))
+    except FileNotFoundError:
+        return []
+    return [{"idx": s.index,
+             "start": round(s.start.total_seconds(), 3),
+             "end": round(s.end.total_seconds(), 3),
+             "text": s.content} for s in subs]
+
+
+def build_shared_context(config) -> dict:
+    """The whole-clip timeline handed to the agent ONCE (not per issue). Lets the
+    agent reason across neighboring lines/spans instead of a single flagged box —
+    e.g. compare a diarization onset to a subtitle box to detect original-audio bleed.
+
+    Trimmed to the alignment-relevant fields; the heavy per-line emotion/energy blobs
+    stay in the per-issue slice (build_evidence_bundle)."""
     d = config.data_output_folder
-    orig = _subs_by_idx(os.path.join(d, "subtitles.srt"))
-    trans = _subs_by_idx(os.path.join(d, "subtitles_translated.srt"))
-    retrans = _subs_by_idx(os.path.join(d, "subtitles_retranslated.srt"))
-    emotions = _load_json(os.path.join(d, "emotions_tags.json"), {})
     diar = _load_json(os.path.join(d, "speakers_segments_data.json"), [])
     stats_doc = _load_json(os.path.join(d, "build_final_stats.json"), [])
     stats_rows = stats_doc.get("stats", []) if isinstance(stats_doc, dict) else stats_doc
-    stats_by_idx = {row["index"]: row for row in stats_rows}
-    natural = _load_json(os.path.join(d, "natural_timing.json"), {})
-    per_line_atempo = natural.get("per_line_atempo", {})
-    visibility_doc = _load_json(os.path.join(d, "subtitles_visibility.json"), [])
-    visibility = ({row["index"]: row for row in visibility_doc}
-                  if isinstance(visibility_doc, list) else visibility_doc)
+    speakers = _load_json(os.path.join(d, "speakers_data.json"), {})
+
+    timing = [{
+        "idx": r.get("index"),
+        "box_start_ms": r.get("subtitle_start_ms"),
+        "box_end_ms": r.get("subtitle_end_ms"),
+        "actual_start_ms": r.get("actual_start_ms"),
+        "actual_end_ms": r.get("actual_end_ms"),
+        "status": r.get("timing_status"),
+        "speed_factor": r.get("applied_speed_factor"),
+    } for r in stats_rows]
+
+    return {
+        # what each line was TTS-spoken from (the ground truth the audio was built on)
+        "subtitles_retranslated": _subs_rows(
+            os.path.join(d, "subtitles_retranslated.srt")),
+        # source-language transcript, for "was this foreign word actually said?" checks
+        "subtitles_original": _subs_rows(os.path.join(d, "subtitles.srt")),
+        # where real speech actually is in the original vocal (ground truth for timing)
+        "diarization": [{"start": round(s["start"], 3), "end": round(s["end"], 3),
+                         "speaker": s.get("speaker")} for s in diar],
+        "timing": timing,
+        # the cast: who exists and their gender (for change_speaker reasoning)
+        "speakers": {k: {"gender": v.get("gender")} for k, v in speakers.items()}
+        if isinstance(speakers, dict) else {},
+    }
+
+
+def build_evidence_bundle(issues, config) -> dict:
+    """Slim per-issue evidence (keyed by sub_index): only the line-specific numeric
+    signals — emotion, vocal energy around the window, and the hallucination mismatch
+    signal. The whole-clip timeline (subs/diarization/timing/speakers) is shared once
+    via build_shared_context, so it is NOT duplicated here. Issues with no sub_index
+    carry no slice; the agent locates them on the shared timeline via their start/end."""
+    d = config.data_output_folder
+    retrans = _subs_by_idx(os.path.join(d, "subtitles_retranslated.srt"))
+    emotions = _load_json(os.path.join(d, "emotions_tags.json"), {})
+    diar = _load_json(os.path.join(d, "speakers_segments_data.json"), [])
 
     bundle: dict[int, dict] = {}
     for issue in issues:
@@ -87,21 +130,9 @@ def build_evidence_bundle(issues, config) -> dict:
         retrans_content = retrans[idx].content if idx in retrans else ""
         spans = diarization_spans_overlapping(diar, issue.start, issue.end)
         bundle[idx] = {
-            "qc": {"start": issue.start, "end": issue.end,
-                   "symptom": issue.symptom, "mismatch": issue.mismatch},
-            "text": {
-                "original": orig[idx].content if idx in orig else "",
-                "translated": trans[idx].content if idx in trans else "",
-                "retranslated": retrans_content,
-            },
-            "diarization_spans": spans,
             "vocal_energy": _vocal_energy_stats(config.vocal_file, issue.start,
                                                 issue.end),
-            "mismatch_signal": _mismatch_signal(spans, retrans_content,
-                                                issue.end - issue.start),
+            "mismatch_signal": _mismatch_signal(spans, retrans_content),
             "emotion": emotions.get(str(idx), {}),
-            "timing": stats_by_idx.get(idx, {}),
-            "per_line_atempo": per_line_atempo.get(str(idx)),
-            "visibility": visibility.get(idx, visibility.get(str(idx), {})),
         }
     return bundle
