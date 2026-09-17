@@ -10,6 +10,8 @@ import soundfile as sf
 import pyloudnorm as pyln
 import srt
 
+from parallel import parallel_map
+
 @dataclass
 class LoudnessConfig:
     target_sr: int = 48000
@@ -32,10 +34,14 @@ def read_wav_float(path: str | Path) -> tuple[np.ndarray, int]:
     return audio, sr
 
 
-def write_wav_float(path: str | Path, audio: np.ndarray, sr: int) -> None:
+def write_wav_int32(path: str | Path, audio: np.ndarray, sr: int) -> None:
+    """Write the per-line loudness output as 32-bit PCM. int32 is bit-exact for our
+    float signal (−192 dB LSB) AND — unlike float WAV — pydub reads it natively in the
+    final build (Python `wave`, no per-file ffmpeg spawn: ~0.1ms vs ~68ms). The pipeline
+    already converts these files to int32 on load, so this changes nothing downstream."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(path), audio.astype(np.float32, copy=False), sr, format="WAV", subtype="FLOAT")
+    sf.write(str(path), audio.astype(np.float32, copy=False), sr, format="WAV", subtype="PCM_32")
 
 
 def to_mono(audio: np.ndarray) -> np.ndarray:
@@ -184,10 +190,12 @@ def run_line_loudness_stage(
     if vocals_sr != cfg.target_sr:
         raise ValueError(f"Unexpected vocals sample rate: {vocals_sr}, expected {cfg.target_sr}")
 
-    entries: List[Dict[str, Any]] = []
     with open(subtitles_file, 'r', encoding='utf-8') as f:
         subs = list(srt.parse(f.read()))
-    for sub in subs:
+
+    # Per-line measurement is independent (own files, no cross-line state) and the
+    # entries are re-sorted below, so it parallelizes safely. Returns None to skip.
+    def _measure(sub):
         content = sub.content.strip()
         speaker = content.split(":", 1)[0].strip() if ":" in content else "__NO_SPEAKER__"
 
@@ -199,7 +207,7 @@ def run_line_loudness_stage(
 
         if not os.path.exists(tts_path):
             print(f"⚠️ Missing TTS segment {tts_path}, skipping loudness adjust")
-            continue
+            return None
 
         tts_audio, tts_sr = read_wav_float(tts_path)
         if tts_sr != cfg.target_sr:
@@ -217,7 +225,7 @@ def run_line_loudness_stage(
         tts_lufs = try_measure_lufs(tts_mono, tts_sr, cfg.min_ref_duration_sec)
         raw_gain_db, gain_mode = compute_gain_db(tts_lufs, ref_lufs, cfg)
 
-        entries.append({
+        return {
             "idx": idx,
             "_speaker": speaker,
             "_start": start,
@@ -229,14 +237,17 @@ def run_line_loudness_stage(
             "raw_gain_db": raw_gain_db,
             "gain_mode": gain_mode,
             "peak_before_dbfs": peak_dbfs(tts_mono),
-        })
+        }
 
+    entries: List[Dict[str, Any]] = [e for e in parallel_map(_measure, subs)
+                                     if e is not None]
+
+    # Cross-line gain smoothing must stay serial — it reads neighboring entries.
     entries.sort(key=lambda x: (x["_start"], x["idx"]))
     smooth_gains_by_speaker(entries, cfg)
 
-    final_entries: List[Dict[str, Any]] = []
-
-    for entry in entries:
+    # Per-line apply/write is independent again; parallel_map preserves entry order.
+    def _apply(entry):
         audio, sr = read_wav_float(entry["tts_path"])
         gain_db = entry["smoothed_gain_db"]
 
@@ -244,9 +255,9 @@ def run_line_loudness_stage(
         out_audio = peak_limit_by_scaling(out_audio, cfg.peak_target_dbfs)
         out_audio = apply_fades(out_audio, sr, cfg.fade_ms)
 
-        write_wav_float(entry["final_line_path"], out_audio, sr)
+        write_wav_int32(entry["final_line_path"], out_audio, sr)
 
-        final_entries.append({
+        return {
             "idx": entry["idx"],
             "tts_path": entry["tts_path"],
             "final_line_path": entry["final_line_path"],
@@ -258,7 +269,7 @@ def run_line_loudness_stage(
             "gain_mode": entry["gain_mode"],
             "peak_before_dbfs": entry["peak_before_dbfs"],
             "peak_after_dbfs": peak_dbfs(to_mono(out_audio)),
-        })
+        }
 
-    return final_entries
+    return parallel_map(_apply, entries)
 

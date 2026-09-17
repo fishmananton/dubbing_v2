@@ -92,6 +92,44 @@ def test_drop_sub_ids_empty_is_noop(tmp_path):
     assert list(s.index for s in srt.parse(p.read_text(encoding="utf-8"))) == [1, 2]
 
 
+import json
+
+
+def test_drop_sub_ids_stashes_dropped_blocks_to_sidecar(tmp_path):
+    # Song detection deletes lines that were ALREADY translated. Instead of destroying
+    # that English text, soft-drop stashes each dropped block {idx,start,end,content}
+    # into a sidecar so QC's restore_line can bring it back with no re-translation.
+    subs = [_sub(1, 0, 1, "a"), _sub(3, 4, 5, "locked him in the closet"),
+            _sub(4, 6, 7, "d")]
+    p = tmp_path / "subtitles_translated.srt"
+    p.write_text(srt.compose(subs, reindex=False), encoding="utf-8")
+    sidecar = tmp_path / "dropped_song_lines.json"
+
+    removed = drop_sub_ids(str(p), [3], sidecar_path=str(sidecar))
+    assert removed == [3]
+    # line 3 gone from the translated SRT
+    assert [s.index for s in srt.parse(p.read_text(encoding="utf-8"))] == [1, 4]
+    # but preserved verbatim in the sidecar, keyed by idx
+    stash = json.loads(sidecar.read_text(encoding="utf-8"))
+    row = stash["3"]
+    assert row["start_ms"] == 4000 and row["end_ms"] == 5000
+    # full block content preserved verbatim, incl. the "Speaker:" prefix
+    assert row["content"] == "Speaker: locked him in the closet"
+
+
+def test_drop_sub_ids_sidecar_accumulates_across_calls(tmp_path):
+    # Two drop passes must both persist; the second must not clobber the first.
+    subs = [_sub(1, 0, 1, "a"), _sub(2, 2, 3, "b"), _sub(3, 4, 5, "c")]
+    p = tmp_path / "subtitles_translated.srt"
+    p.write_text(srt.compose(subs, reindex=False), encoding="utf-8")
+    sidecar = tmp_path / "dropped_song_lines.json"
+
+    drop_sub_ids(str(p), [2], sidecar_path=str(sidecar))
+    drop_sub_ids(str(p), [3], sidecar_path=str(sidecar))
+    stash = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert set(stash.keys()) == {"2", "3"}
+
+
 import song_detect as sd
 
 

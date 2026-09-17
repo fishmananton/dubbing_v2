@@ -97,21 +97,43 @@ def build_chunk_script(chunk: Chunk) -> str:
     return "\n".join(lines)
 
 
-def drop_sub_ids(srt_path: str, ids: list[int]) -> list[int]:
+def drop_sub_ids(srt_path: str, ids: list[int],
+                 sidecar_path: str | None = None) -> list[int]:
     """Remove subtitles whose index is in `ids` from the SRT file, in place.
-    reindex=False keeps surviving indices stable. Returns the IDs actually
-    removed."""
+    reindex=False keeps surviving indices stable. Returns the IDs actually removed.
+
+    Soft-drop: the dropped lines were ALREADY translated, so before removing them we
+    stash each block {start_ms,end_ms,content} into `sidecar_path` (keyed by idx,
+    accumulating across calls). QC's restore_line reads that stash to bring a
+    mis-dropped line back with no re-translation."""
     id_set = set(ids)
     if not id_set:
         return []
     subs = list(srt.parse(open(srt_path, encoding="utf-8").read()))
     present = {s.index for s in subs}
-    remaining = [s for s in subs if s.index not in id_set]
     removed = sorted(id_set & present)
+    if sidecar_path and removed:
+        _stash_dropped(sidecar_path, [s for s in subs if s.index in id_set])
+    remaining = [s for s in subs if s.index not in id_set]
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write(srt.compose(sorted(remaining, key=lambda x: x.start),
                             reindex=False))
     return removed
+
+
+def _stash_dropped(sidecar_path: str, dropped: list) -> None:
+    try:
+        stash = json.loads(open(sidecar_path, encoding="utf-8").read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        stash = {}
+    for s in dropped:
+        stash[str(s.index)] = {
+            "start_ms": int(s.start.total_seconds() * 1000),
+            "end_ms": int(s.end.total_seconds() * 1000),
+            "content": s.content,
+        }
+    with open(sidecar_path, "w", encoding="utf-8") as f:
+        json.dump(stash, f, ensure_ascii=False, indent=2)
 
 
 SONG_SYSTEM_PROMPT = (

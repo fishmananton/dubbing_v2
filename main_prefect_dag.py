@@ -46,7 +46,7 @@ from song_detect import detect_songs, drop_sub_ids
 from qc_tail import (append_promotion_queue, build_fix_log, diff_reqc,
                      split_auto_and_proposals, write_fix_log, write_qc_issues)
 from test_dub_qc import (build_script, compress_audio, _retry_call,
-                         qc_check as qc_listen_check)
+                         qc_check as qc_listen_check, qc_check_chunked)
 from final_audio import build_audio, measure_loudness
 from prefect.cache_policies import NO_CACHE
 from tts_inworld import tts_generate_multivoice_inworld_segments
@@ -236,17 +236,25 @@ def t_retranslate_timing_fix(config, overflow_requests, underflow_requests, targ
 @task(cache_policy=NO_CACHE)
 def t_qc_listen_check(subtitles_file, audio_file, label="QC listen check"):
     with timer(label):
+        import srt as _srt
         from google import genai
-        script = build_script(subtitles_file)
-        audio_bytes = compress_audio(audio_file)
+        from pydub import AudioSegment
         gclient = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         gmodel = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-        return qc_listen_check(audio_bytes=audio_bytes, script=script,
-                               client=gclient, model=gmodel)
+        # A/B knobs, env-tunable with no code edit: pass count + thinking level.
+        passes = int(os.getenv("QC_PASSES", "3"))
+        thinking = os.getenv("QC_THINKING_LEVEL", "HIGH")
+        # Chunk long audio and run ALL (chunk x pass) reviews in parallel (each rebased
+        # to absolute time, then unioned). Applies to both the first QC and the re-QC.
+        subs = list(_srt.parse(open(subtitles_file, encoding="utf-8").read()))
+        seg = AudioSegment.from_file(audio_file).set_channels(1)  # decode once
+        return qc_check_chunked(seg=seg, subs=subs, client=gclient, model=gmodel,
+                                passes=passes, thinking_level=thinking)
 
 
 @task(cache_policy=NO_CACHE)
-def t_qc_decide(issues, bundle, playbook, audio_file, context=None):
+def t_qc_decide(issues, bundle, playbook, audio_file, context=None,
+                dropped_lines=None):
     with timer("QC decide"):
         from google import genai
         from pydub import AudioSegment
@@ -292,7 +300,8 @@ def t_qc_decide(issues, bundle, playbook, audio_file, context=None):
             return clips
 
         return qc_decide(issues, bundle, playbook, model_call=_model_call,
-                         audio_provider=_audio_provider, context=context)
+                         audio_provider=_audio_provider, context=context,
+                         dropped_lines=dropped_lines)
 
 
 
@@ -831,7 +840,8 @@ def dubbing_flow(
     if detect_songs_fut is not None:
         song_ids = detect_songs_fut.result()
         if song_ids:
-            dropped = drop_sub_ids(config.subtitles_translated_file, song_ids)
+            dropped = drop_sub_ids(config.subtitles_translated_file, song_ids,
+                                   sidecar_path=config.dropped_song_lines_file)
             print(f"🎵 dropped {len(dropped)} sung line(s) from translated SRT: {dropped}")
 
     if stage <= STAGES.GENERATE:
@@ -1147,10 +1157,18 @@ def dubbing_flow(
                     bundle = build_evidence_bundle(issues, config)
                     context = build_shared_context(config)
                     playbook = load_playbook("config/qc_playbook.json")
+                    # Stash of lines soft-dropped by song detection; lets the agent
+                    # promote a hedged "restore this window" propose into restore_line.
+                    try:
+                        dropped_lines = json.loads(
+                            Path(config.dropped_song_lines_file).read_text())
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        dropped_lines = {}
 
                     decisions = t_qc_decide.submit(
                         issues, bundle, playbook,
-                        config.audio_result_file, context=context).result()
+                        config.audio_result_file, context=context,
+                        dropped_lines=dropped_lines).result()
                     auto, proposals = split_auto_and_proposals(decisions)
 
                     if not auto:                                 # all proposals -> no regen
@@ -1167,7 +1185,8 @@ def dubbing_flow(
                                       if not d.auto_apply and d not in proposals]
                         changed = apply_fixes(
                             auto, subtitles_file=config.subtitles_retranslated_file,
-                            emotions_file=config.emotions_tags_file)
+                            emotions_file=config.emotions_tags_file,
+                            dropped_lines_file=config.dropped_song_lines_file)
 
                         _regen_and_combine(
                             config=config, speakers_array=speakers_array,
@@ -1181,6 +1200,14 @@ def dubbing_flow(
                             use_non_speech=use_non_speech, video_file=video_file,
                             changed_list=changed, qc_fix=True)
 
+                        # Pass-2 audio is now written. Render the pass-2 video and run
+                        # re-QC concurrently — re-QC only listens to the audio, so the
+                        # render (which just reads that same audio) can overlap it
+                        # instead of waiting behind it, mirroring the pass-1 pattern.
+                        pass2_video_fut = t_generate_videos.submit(
+                            config, video_file, config.audio_result_file,
+                            preview=False)
+
                         reqc_issues = t_qc_listen_check.submit(
                             config.subtitles_retranslated_file,
                             config.audio_result_file, label="QC re-check").result()
@@ -1193,10 +1220,8 @@ def dubbing_flow(
                             auto, "config/qc_promotion_queue.json")
                         write_fix_log(build_fix_log(auto, proposals, reqc_count=1),
                                       qc_log_path)
-                        # Re-render video from the pass-2 audio.
-                        output_file = _finalize_video(t_generate_videos.submit(
-                            config, video_file, config.audio_result_file,
-                            preview=False).result())
+                        # Await the pass-2 render that overlapped re-QC.
+                        output_file = _finalize_video(pass2_video_fut.result())
             except Exception as e:  # noqa: BLE001 — QC-fix must never fail the dub
                 print(f"⚠️  QC-fix tail failed ({e}); shipping render pass 1")
                 write_fix_log({"summary": {"error": str(e)}, "decisions": [],
@@ -1226,17 +1251,17 @@ def preconfigure():
 # # # === Entry Point ===
 if __name__ == "__main__":
     preconfigure()
-    dubbing_flow("input/osob_CUT.mp4",
-                 dst_language="en",
+    dubbing_flow("input/rapuntsel.mp4",
+                 dst_language="ru",
                  trans_type='default',
                  emotions_flag=True,
-                 ttsmodel=TTS_MODEL.INDEXTTS2.value,
+                 ttsmodel=TTS_MODEL.QWEN3TTS.value,
                  elevenlabs_emotions=ELEVENLABS_EMOTIONS.HIGH.value,
                  # num_speakers=1,
                  test_mode=False,
                  changed_list=[],
-                 run_id='20260922_osob_CUT_11',
+                 run_id='20260922_rapuntsel_CUT_05',
                  # test_duration_sec=120,
                  is_dubbed=False,
                  use_non_speech=True,
-                 stage = STAGES.COMBINE.value)
+                 stage = STAGES.SPLIT.value)

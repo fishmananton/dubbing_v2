@@ -14,6 +14,7 @@ from post_build_fix import apply_retranslation
 PRIMITIVE_THRESHOLDS: dict[str, float] = {
     "edit_text": 0.70,
     "change_timing": 0.70,
+    "restore_line": 0.70,
     "set_emotion": 0.80,
     "change_speaker": 0.85,
     "drop_line": 0.90,
@@ -30,6 +31,7 @@ REQUIRED_PARAMS: dict[str, tuple[str, ...]] = {
     "change_timing": ("new_start_ms", "new_end_ms"),
     "set_emotion": ("tag", "category", "vector"),
     "drop_line": (),
+    "restore_line": (),  # resolves by window param or the decision's own idx
 }
 
 
@@ -43,6 +45,7 @@ COLLISION_TIER: dict[str, int] = {
     "set_emotion": 2,
     "change_timing": 1,
     "edit_text": 1,
+    "restore_line": 1,
 }
 
 
@@ -86,6 +89,7 @@ PRIMITIVE_FIELD: dict[str, str] = {
     "change_timing": "timing",
     "change_speaker": "speaker",
     "set_emotion": "emotion",
+    "restore_line": "line",
 }
 
 
@@ -99,10 +103,15 @@ def resolve_collisions(auto: list[Decision]) -> list[Decision]:
     Different fields -> keep both. drop_line removes the line, so it conflicts with
     any other primitive on that idx and wins by tier. Done in code, not the model."""
     by_idx: dict[int, list[Decision]] = {}
+    kept: list[Decision] = []
     for d in auto:
+        if d.idx < 0:
+            # idx<0 means "not a specific line" (e.g. a window restore); it targets a
+            # time span, not a subtitle index, so it can never collide with anything.
+            kept.append(d)
+            continue
         by_idx.setdefault(d.idx, []).append(d)
 
-    kept: list[Decision] = []
     for idx, group in by_idx.items():
         if len(group) == 1:
             kept.append(group[0])
@@ -184,8 +193,57 @@ def _set_emotion(idx: int, tag: str, category: str, vector: list[float],
     return [idx]
 
 
+def _restore_line(d: Decision, subtitles_file: str,
+                  dropped_lines_file: str | None) -> list[int]:
+    """Re-insert lines that song detection soft-dropped. Resolves targets against the
+    sidecar stash: a window [start_s, end_s] restores every stashed block whose time
+    span overlaps it; otherwise the decision's own idx restores that single block.
+    Blocks are re-inserted verbatim (already-translated, incl. speaker prefix) with
+    their original idx/times, so no re-translation happens."""
+    if not dropped_lines_file:
+        return []
+    try:
+        stash = json.loads(open(dropped_lines_file, encoding="utf-8").read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+    window = d.params.get("window")
+    targets: list[str] = []
+    if window:
+        lo_ms, hi_ms = window[0] * 1000, window[1] * 1000
+        for k, row in stash.items():
+            if row["start_ms"] < hi_ms and row["end_ms"] > lo_ms:  # overlap
+                targets.append(k)
+    elif d.idx >= 0 and str(d.idx) in stash:
+        targets.append(str(d.idx))
+
+    if not targets:
+        return []
+
+    subs = list(_srt.parse(open(subtitles_file, encoding="utf-8").read()))
+    present = {s.index for s in subs}
+    restored: list[int] = []
+    for k in targets:
+        idx = int(k)
+        if idx in present:
+            continue
+        row = stash[k]
+        subs.append(_srt.Subtitle(
+            index=idx,
+            start=timedelta(milliseconds=row["start_ms"]),
+            end=timedelta(milliseconds=row["end_ms"]),
+            content=row["content"],
+        ))
+        restored.append(idx)
+    if not restored:
+        return []
+    with open(subtitles_file, "w", encoding="utf-8") as f:
+        f.write(_srt.compose(sorted(subs, key=lambda x: x.start), reindex=False))
+    return restored
+
+
 def apply_fixes(decisions: list[Decision], subtitles_file: str,
-                emotions_file: str) -> list[int]:
+                emotions_file: str, dropped_lines_file: str | None = None) -> list[int]:
     """Write each auto-apply decision to the frozen retranslated SRT (text/speaker/
     timing/drop) or emotions_tags.json (emotion). Returns changed indices for regen."""
     changed: list[int] = []
@@ -205,6 +263,8 @@ def apply_fixes(decisions: list[Decision], subtitles_file: str,
         elif p == "set_emotion":
             changed += _set_emotion(d.idx, prm["tag"], prm["category"],
                                     prm["vector"], emotions_file)
+        elif p == "restore_line":
+            changed += _restore_line(d, subtitles_file, dropped_lines_file)
     return sorted(set(changed))
 
 

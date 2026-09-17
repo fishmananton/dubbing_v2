@@ -201,6 +201,83 @@ def test_only_auto_apply_decisions_are_written(tmp_path):
     assert _read_subs(srt_path)[1].content == "SPEAKER_00: original"
 
 
+def test_restore_line_auto_applies_at_threshold():
+    d = make(-1, "restore_line", 0.70, window=[100.0, 113.0])
+    apply_gate([d])
+    assert d.auto_apply is True
+
+
+def test_two_window_restores_both_survive_collision():
+    # Null-idx restores both carry idx=-1 but target different time spans; they must
+    # NOT downgrade each other (idx<0 means "not a specific line", never a conflict).
+    a = make(-1, "restore_line", 0.9, window=[100.0, 113.0])
+    b = make(-1, "restore_line", 0.9, window=[702.0, 748.0])
+    a.auto_apply = b.auto_apply = True
+    kept = resolve_collisions([a, b])
+    assert len(kept) == 2
+    assert all(d.auto_apply for d in kept)
+
+
+def _write_stash(path, rows):
+    # rows: list of (idx, start_ms, end_ms, content)
+    stash = {str(i): {"start_ms": s, "end_ms": e, "content": c}
+             for (i, s, e, c) in rows}
+    path.write_text(json.dumps(stash, ensure_ascii=False))
+
+
+def test_restore_line_window_reinserts_overlapping_stashed_lines(tmp_path):
+    # A mis-dropped dialogue block (idx 3,4,5) sits in the sidecar. A window restore
+    # re-inserts every stashed line overlapping the window into the retranslated SRT.
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(2, 66.0, 66.7, "Rapunzel: Ah."),
+                          (6, 113.7, 117.2, "Rapunzel: So I can't...")])
+    stash = tmp_path / "dropped_song_lines.json"
+    _write_stash(stash, [
+        (3, 100800, 103100, "Rapunzel: So I locked him in the closet."),
+        (4, 103700, 105800, "Rapunzel: I locked him in the closet."),
+        (5, 107500, 111100, "Rapunzel: I went and locked him in the closet."),
+    ])
+    d = make(-1, "restore_line", 0.9, window=[100.0, 113.0])
+    d.auto_apply = True
+    changed = apply_fixes([d], subtitles_file=str(srt_path),
+                          emotions_file=str(tmp_path / "emo.json"),
+                          dropped_lines_file=str(stash))
+    assert changed == [3, 4, 5]
+    subs = _read_subs(srt_path)
+    assert subs[3].content == "Rapunzel: So I locked him in the closet."
+    assert subs[3].start == timedelta(milliseconds=100800)
+    assert set(subs.keys()) == {2, 3, 4, 5, 6}
+
+
+def test_restore_line_by_explicit_idx(tmp_path):
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(1, 0, 1, "S: a")])
+    stash = tmp_path / "dropped_song_lines.json"
+    _write_stash(stash, [(1, 0, 1, "S: a"),
+                         (7, 5000, 6000, "S: restored")])
+    d = make(7, "restore_line", 0.9)
+    d.auto_apply = True
+    changed = apply_fixes([d], subtitles_file=str(srt_path),
+                          emotions_file=str(tmp_path / "emo.json"),
+                          dropped_lines_file=str(stash))
+    assert changed == [7]
+    assert _read_subs(srt_path)[7].content == "S: restored"
+
+
+def test_restore_line_no_match_is_safe_noop(tmp_path):
+    srt_path = tmp_path / "retrans.srt"
+    _write_srt(srt_path, [(1, 0, 1, "S: a")])
+    stash = tmp_path / "dropped_song_lines.json"
+    _write_stash(stash, [(3, 100000, 101000, "S: dropped")])
+    d = make(-1, "restore_line", 0.9, window=[500.0, 600.0])  # no overlap
+    d.auto_apply = True
+    changed = apply_fixes([d], subtitles_file=str(srt_path),
+                          emotions_file=str(tmp_path / "emo.json"),
+                          dropped_lines_file=str(stash))
+    assert changed == []
+    assert set(_read_subs(srt_path).keys()) == {1}
+
+
 from qc_fixes import load_playbook, match_playbook
 
 
