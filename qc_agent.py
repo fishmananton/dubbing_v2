@@ -38,6 +38,15 @@ it, or a foreign/original word bleeds beside the line. The QC timestamp is appro
 and points at the line, not the leak; the leaked audio sits in the gap just outside the \
 box, so find its diarization span there and move the boundary out past it. Restating the \
 box's existing edge is a no-op, not a fix; never cross into a neighbor's box.
+- restore_line {window:[start_s,end_s]}: original-language audio bleeds through a span \
+with NO dub box, because song detection removed the line before TTS (its already- \
+translated text sits unused). Restore ONLY when that removed audio is genuinely SPOKEN \
+dialogue that song detection misjudged as sung — e.g. speech delivered over a musical \
+bed — or a very short fragment whose meaning is essential to follow the plot; emit \
+restore_line over the leak's diarization span so the line(s) are re-dubbed. Do NOT \
+restore genuine singing: TTS cannot sing and would flatten a real song, so leave a true \
+sung passage in its original voice. This differs from change_timing, which only widens \
+an existing box; restore_line reinstates a line that no longer has a box.
 - set_emotion {idx, tag, category, vector}: the delivered emotion is clearly wrong for \
 the line.
 - change_speaker {idx, new_speaker}: the voice is misattributed. When a whole block is \
@@ -49,8 +58,10 @@ evidence is too ambiguous to decide. `suggested_fix` states the human action.
 Commit to concrete actions. Reach for `propose` only when you are truly unsure what the \
 fix is, not merely because a fix spans multiple lines or fields — in that case emit all \
 the actions. If an issue has no sub_index it's audio in a gap: locate it on the \
-timeline; if a real box sits next to the leak, extend that box's timing to cover it \
-rather than proposing; only if no box is near do you propose. Emit `confidence` in \
+timeline; if a real box sits next to the leak, extend that box's timing to cover it; if \
+no box exists there and the removed audio is spoken dialogue (or a short plot-essential \
+fragment) rather than genuine singing, restore_line it; if it is a real sung passage, \
+leave it; otherwise propose. Emit `confidence` in \
 [0,1]; emit needs_audio {idx, window:[start_s,end_s]} if you must hear it to decide \
 (the window may extend past the box). Set playbook_pattern_matched true when it matches \
 a provided playbook pattern."""
@@ -76,7 +87,7 @@ def _raw_idx(raw: dict) -> int:
 # them flat at the top level of the decision object. Collect from both.
 _PARAM_KEYS = {
     "new_text", "new_speaker", "new_start_ms", "new_end_ms",
-    "tag", "category", "vector", "suggested_fix",
+    "tag", "category", "vector", "suggested_fix", "window",
 }
 
 
@@ -121,7 +132,19 @@ def _is_hallucination(evidence: dict) -> bool:
 # matching action primitive and let the per-primitive confidence gate decide. Concrete
 # fix params imply text/speaker/timing/emotion edits; drop_line is inferred only from the
 # hallucination evidence signal (it carries no param), so it is never promoted blindly.
-def _promote_primitive(primitive: str, params: dict, evidence: dict) -> str:
+def _window_overlaps_stash(window, dropped_lines: dict | None) -> bool:
+    """True if [start_s, end_s] overlaps any stashed dropped line's [start_ms, end_ms].
+    A window over real restorable content is what distinguishes a restore intent from a
+    generic 'human, please look' proposal."""
+    if not dropped_lines or not window or len(window) != 2:
+        return False
+    lo_ms, hi_ms = window[0] * 1000, window[1] * 1000
+    return any(row["start_ms"] < hi_ms and row["end_ms"] > lo_ms
+               for row in dropped_lines.values())
+
+
+def _promote_primitive(primitive: str, params: dict, evidence: dict,
+                       dropped_lines: dict | None = None) -> str:
     if primitive != "propose":
         return primitive
     if params.get("new_text"):
@@ -132,14 +155,21 @@ def _promote_primitive(primitive: str, params: dict, evidence: dict) -> str:
         return "change_timing"
     if params.get("tag") or params.get("vector") or params.get("category"):
         return "set_emotion"
+    # The model often names the dropped-line window but hedges to 'propose' (real
+    # rapuntsel_CUT_02 gap). If the window overlaps a stashed dropped line, it IS a
+    # restore — commit to restore_line so it applies instead of dying as a proposal.
+    if _window_overlaps_stash(params.get("window"), dropped_lines):
+        return "restore_line"
     if _is_hallucination(evidence):
         return "drop_line"
     return primitive
 
 
-def _to_decision(raw: dict, playbook: list[dict], evidence: dict | None = None) -> Decision:
+def _to_decision(raw: dict, playbook: list[dict], evidence: dict | None = None,
+                 dropped_lines: dict | None = None) -> Decision:
     params = _collect_params(raw)
-    primitive = _promote_primitive(raw.get("primitive", "propose"), params, evidence or {})
+    primitive = _promote_primitive(raw.get("primitive", "propose"), params,
+                                   evidence or {}, dropped_lines)
     if primitive == "edit_text":
         _lift_edit_text(params, raw.get("diagnosis", ""))
     matched = bool(raw.get("playbook_pattern_matched", False))
@@ -200,7 +230,8 @@ def _all_proposals(issues) -> list[Decision]:
 def decide(issues, bundle, playbook,
            model_call: Callable[[str, str, object], dict],
            audio_provider: Callable[[list[dict]], dict] | None = None,
-           context: dict | None = None) -> list[Decision]:
+           context: dict | None = None,
+           dropped_lines: dict | None = None) -> list[Decision]:
     """Two-phase agent. Phase 1: text only. Phase 2 (optional): re-invoke with audio
     clips for issues that requested them. Any exception -> all proposals (never blocks
     the pipeline). Returns Decisions with the gate applied; collision resolution is the
@@ -236,7 +267,8 @@ def decide(issues, bundle, playbook,
             raws = [r for r in raws if _raw_idx(r) not in resolved_idxs]
             raws += _decisions_from_response(phase2)
 
-        decisions = [_to_decision(r, playbook, bundle.get(_raw_idx(r), {}))
+        decisions = [_to_decision(r, playbook, bundle.get(_raw_idx(r), {}),
+                                  dropped_lines)
                      for r in raws]
         apply_gate(decisions)
         return decisions

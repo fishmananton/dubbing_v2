@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -180,9 +181,13 @@ def loudnorm_pass2(
     # duck_attack: int = 15,
     # duck_release: int = 280,
 
-def measure_loudness(input_file: str) -> dict:
-    """Measure integrated loudness (LUFS) and LRA of an audio/video file.
-    Returns dict with 'i' (integrated LUFS) and 'lra' (loudness range)."""
+# Memoize by (path, mtime, size): a source file's loudness is invariant within a run,
+# but build_audio scans it on every call (2-4x per run). Cache the ffmpeg result; a
+# changed file (different mtime/size) recomputes. Behavior-preserving.
+_loudness_cache: dict = {}
+
+
+def _measure_loudness_uncached(input_file: str) -> dict:
     cmd = [
         "ffmpeg", "-y",
         "-i", input_file,
@@ -195,6 +200,23 @@ def measure_loudness(input_file: str) -> dict:
         return {"i": -16.0, "lra": 7.0}
     data = json.loads(match.group(0))
     return {"i": float(data["input_i"]), "lra": float(data["input_lra"])}
+
+
+def measure_loudness(input_file: str) -> dict:
+    """Measure integrated loudness (LUFS) and LRA of an audio/video file.
+    Returns dict with 'i' (integrated LUFS) and 'lra' (loudness range).
+    Memoized by (path, mtime, size) so repeated calls on the same file skip ffmpeg."""
+    try:
+        st = os.stat(input_file)
+        key = (os.path.abspath(input_file), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and key in _loudness_cache:
+        return _loudness_cache[key]
+    result = _measure_loudness_uncached(input_file)
+    if key is not None:
+        _loudness_cache[key] = result
+    return result
 
 
 def build_audio(

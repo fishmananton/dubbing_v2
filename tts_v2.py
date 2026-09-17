@@ -12,6 +12,8 @@ import requests
 import time
 import json
 
+from parallel import parallel_map
+
 
 def strip_silence(
     audio: AudioSegment,
@@ -84,6 +86,41 @@ def adjust_speed(segment: AudioSegment, factor: float) -> AudioSegment:
 def speed_len_ms(length_ms: int, factor: float) -> int:
 
     return max(1, int(round(length_ms / factor)))
+
+
+def _nonoverflow_speed_factor(raw_len: float, subtitle_duration: float,
+                              speaker_base: float,
+                              max_speed_factor: float | None) -> float | None:
+    """The speaker_base-mode speed factor when it is PLACEMENT-INDEPENDENT.
+
+    Mirrors the non-overflow branch of the timeline loop (tts_v2.py speaker_base path):
+    when needed = raw_len/subtitle_duration <= speaker_base, the factor is a pure
+    function of the line's own numbers, clamped to [0.92, speaker_base] and then the
+    global max_speed_factor cap. Returns None for the overflow branch (needed >
+    speaker_base), whose factor depends on actual_available_duration → next_free_start_ms
+    and therefore cannot be known before the sequential placement loop runs."""
+    needed = raw_len / subtitle_duration if subtitle_duration > 0 else 1.0
+    if needed > speaker_base:
+        return None
+    factor = max(0.92, min(needed, speaker_base))
+    if max_speed_factor is not None and factor > max_speed_factor:
+        factor = max_speed_factor
+    return factor
+
+
+def _prerender_nonoverflow(items: list[tuple[int, AudioSegment, float]]
+                           ) -> dict[int, AudioSegment]:
+    """Render the placement-independent atempo calls concurrently.
+
+    `items` is (idx, segment, factor). No-op factors (==1.0) are skipped exactly as the
+    inline loop skips them. adjust_speed is deterministic, so a pre-rendered clip is
+    byte-identical to the inline one — placement (which uses the clip's real length) is
+    unchanged. Returns {idx: adjusted segment}."""
+    work = [(idx, seg, f) for (idx, seg, f) in items if f != 1.0]
+    if not work:
+        return {}
+    rendered = parallel_map(lambda t: adjust_speed(t[1], t[2]), work)
+    return {work[i][0]: rendered[i] for i in range(len(work))}
 
 def audiosegment_to_float32_mono(seg: AudioSegment) -> np.ndarray:
     samples = np.array(seg.get_array_of_samples())
@@ -204,6 +241,10 @@ def tts_build_final(
         timeline_meta = {}
 
     # ---------------- preload / refresh per-segment data ----------------
+    # Segments are already silence-trimmed at generation (every engine does this) and
+    # loudness_adjust writes int32 PCM, which pydub loads natively (~0.1ms/file, no
+    # ffmpeg) — so this serial load is fast; no re-strip, no parallelism needed.
+    _t0 = time.time()
     for speaker in speakers:
         speaker_subs = [
             sub for sub in raw_subs
@@ -229,7 +270,7 @@ def tts_build_final(
             subtitle_duration = max(1, subtitle_end_ms - subtitle_start_ms)
 
             if os.path.exists(seg_path):
-                seg_audio = strip_silence(AudioSegment.from_file(seg_path, format="wav"))
+                seg_audio = AudioSegment.from_file(seg_path, format="wav")
             else:
                 print(f"⚠️ Missing segment {seg_path}, inserting silence instead")
                 seg_audio = AudioSegment.silent(duration=subtitle_duration)
@@ -321,6 +362,27 @@ def tts_build_final(
 
             final_audio = None
 
+    _t_preload = time.time()
+    # Pre-render the placement-INDEPENDENT (non-overflow) atempo calls in parallel.
+    # Only the final non-testing pass renders audio, and only speaker_base mode has a
+    # non-overflow branch whose factor is knowable before placement. adjust_speed is
+    # deterministic, so the loop below consuming these clips is byte-identical to
+    # rendering inline; overflow lines (factor None) still render inline in the loop.
+    prerendered_speed: dict[int, AudioSegment] = {}
+    if not testing and speaker_base_atempo is not None:
+        pre_items = []
+        for sub in subs[start_pos:]:
+            meta = segment_meta.get(sub.index)
+            if meta is None or sub.index not in audio_cache:
+                continue
+            base = speaker_base_atempo.get(meta["speaker"], 1.0)
+            f = _nonoverflow_speed_factor(meta["raw_len"], meta["subtitle_duration_ms"],
+                                          base, max_speed_factor)
+            if f is not None:
+                pre_items.append((sub.index, audio_cache[sub.index], f))
+        prerendered_speed = _prerender_nonoverflow(pre_items)
+
+    _t_prerender = time.time()
     # ---------------- main timeline loop ----------------
     for i in range(start_pos, len(subs)):
         sub = subs[i]
@@ -398,7 +460,12 @@ def tts_build_final(
         else:
             working_audio = seg_audio
             if applied_speed_factor != 1.0:
-                working_audio = adjust_speed(working_audio, applied_speed_factor)
+                # Non-overflow lines were rendered in the parallel pre-pass with this
+                # same factor; reuse that clip. Overflow lines (not pre-rendered) render
+                # inline here, where actual_available_duration is finally known.
+                cached = prerendered_speed.get(idx)
+                working_audio = (cached if cached is not None
+                                 else adjust_speed(working_audio, applied_speed_factor))
             current_len = len(working_audio)
 
         current_subtitle_ratio = current_len / subtitle_duration
@@ -497,6 +564,7 @@ def tts_build_final(
                 "visibility_entries": local_visibility_entries,
             }
 
+    _t_loop = time.time()
     # ---------------- final write only in non-testing ----------------
     if not testing:
         os.makedirs(output_dir, exist_ok=True)
@@ -514,6 +582,12 @@ def tts_build_final(
         )
 
         sf.write(final_path, final_audio, timeline_sr, format="WAV", subtype="FLOAT")
+
+        print(f"⏱️  build_final phases: preload={_t_preload - _t0:.1f}s | "
+              f"atempo_prerender(parallel)={_t_prerender - _t_preload:.1f}s "
+              f"[{len(prerendered_speed)} segs] | "
+              f"loop+assemble(incl. inline overflow atempo)={_t_loop - _t_prerender:.1f}s | "
+              f"export={time.time() - _t_loop:.1f}s")
 
         run_base = os.path.dirname(os.path.dirname(output_dir))  # output/{run_id}
         stats_path = os.path.join(run_base, "data", "build_final_stats.json")

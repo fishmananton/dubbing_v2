@@ -50,6 +50,7 @@ class Configuration:
         self.subtitles_fixed_translated_file = f"{self.data_output_folder}/subtitles_fixed_translated.srt"
         self.subtitles_retranslated_file = f"{self.data_output_folder}/subtitles_retranslated.srt"
         self.subtitles = f"{self.data_output_folder}/subtitles.srt"
+        self.dropped_song_lines_file = f"{self.data_output_folder}/dropped_song_lines.json"
 
         self.final_video_file = f"{self.global_output_folder}/final_video.mp4"
         self.final_video_preview_file = f"{self.global_output_folder}/final_video_preview.mp4"

@@ -191,6 +191,44 @@ def test_edit_text_without_liftable_correction_stays_proposal():
     assert "new_text" not in decisions[0].params
 
 
+def test_propose_with_window_over_dropped_line_promoted_to_restore_line():
+    # The real rapuntsel_CUT_02 gap: model identified a dropped-line window and even put
+    # it in params.window + said "restoring this window", but hedged to 'propose'. When
+    # that window overlaps a stashed dropped line, promote to restore_line so it applies
+    # instead of dying as a human proposal.
+    raw = [{"idx": -1, "primitive": "propose", "confidence": 0.95,
+            "params": {"window": [100.35, 122.65]},
+            "diagnosis": "Russian dialogue bleeds where lines were dropped; restore it."}]
+    dropped = {"3": {"start_ms": 100850, "end_ms": 103145,
+                     "content": "Rapunzel: So I locked him in the closet."}}
+    decisions = decide([Issue(None)], {}, [], model_call=fake_model(raw),
+                       dropped_lines=dropped)
+    assert decisions[0].primitive == "restore_line"
+    assert decisions[0].params["window"] == [100.35, 122.65]
+    assert decisions[0].auto_apply is True  # 0.95 >= 0.70 restore threshold
+
+
+def test_propose_with_window_no_stash_overlap_stays_propose():
+    # A window that overlaps NO stashed dropped line is not a restore — leave it a
+    # proposal for human review rather than emitting a restore that would no-op.
+    raw = [{"idx": -1, "primitive": "propose", "confidence": 0.95,
+            "params": {"window": [500.0, 520.0]}, "diagnosis": "unclear gap"}]
+    dropped = {"3": {"start_ms": 100850, "end_ms": 103145, "content": "x"}}
+    decisions = decide([Issue(None)], {}, [], model_call=fake_model(raw),
+                       dropped_lines=dropped)
+    assert decisions[0].primitive == "propose"
+    assert decisions[0].auto_apply is False
+
+
+def test_propose_with_window_but_no_stash_stays_propose():
+    # No stash available at all -> can't confirm restorable content -> stays propose.
+    raw = [{"idx": -1, "primitive": "propose", "confidence": 0.95,
+            "params": {"window": [100.35, 122.65]}, "diagnosis": "dropped dialogue"}]
+    decisions = decide([Issue(None)], {}, [], model_call=fake_model(raw))
+    assert decisions[0].primitive == "propose"
+    assert decisions[0].auto_apply is False
+
+
 def test_shared_context_forwarded_to_prompt():
     # The whole-clip timeline must reach the model in phase 1 so it can reason across
     # neighboring lines/spans (e.g. diarization onset vs. subtitle box for bleed).

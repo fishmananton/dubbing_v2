@@ -23,6 +23,8 @@ from pydub import AudioSegment
 from dotenv import load_dotenv
 from google import genai
 
+from song_detect import chunk_subs, build_chunk_script, slice_audio_opus
+
 load_dotenv()
 
 
@@ -33,45 +35,51 @@ You are given:
 2. The subtitle script it was generated from: each line has an index, a start/end
    timestamp, a speaker label, and the exact text that was supposed to be spoken.
 
-The script contains ONLY real spoken dialogue. A line ending in "—" or "..." is a
-line the speaker is interrupted on or trails off — it is NOT a stage direction, sound
-effect, or caption. Never flag script text as if it were a direction read aloud.
+### RULES FOR EVALUATION
+Work through the audio line by line against the script. Do not stop at a simple word
+match — evaluate delivery, pacing, and emotion. Judge the dub the way a demanding
+reviewer would before it ships to a paying client.
 
-Work through the audio line by line against the script. For EVERY subtitle, listen to
-the corresponding region of audio and evaluate it on all the dimensions below. Do not
-stop at content match — a line whose words are correct can still be a defect if it is
-delivered flat, rushed, mis-stressed, oddly paced, or emotionally wrong. Judge the dub
-the way a demanding reviewer would before it ships to a paying client.
+The script contains ONLY real spoken dialogue.
+- A line ending in "—" or "..." is an interruption or trail-off. It is NOT a stage
+  direction. Never flag script text as if it were a direction read aloud.
+- Songs are intentionally left in their original language. Do NOT flag original-language
+  singing (any sung or melodic vocal passage, even if the script has a line for it).
+  Only evaluate SPOKEN dialogue.
 
-Report anything on this (non-exhaustive) list:
-- Content mismatch: audio doesn't say the scripted words — wrong/missing/extra words,
-  gibberish, or a non-speech sound (scream, laugh, cough, held vowel, music, noise)
-  where words were expected. This includes STT hallucinations: text that was invented
-  from a shout, a held vowel, or noise in the source and does not belong in the dub.
-- Text normalization: numbers, times, dates, acronyms, or abbreviations spoken wrong
-  (e.g. a clock time read as a plain cardinal number, an acronym mangled into a word).
-- Pronunciation: names or terms mispronounced or given wrong stress.
-- Timing: a line's audio runs past its subtitle window, is cut off short, or is so
-  rushed/dragged that the pacing sounds unnatural.
-- Emotion / delivery: tone contradicts or fails to match the line's intent; robotic,
-  flat, monotone, or affect-less delivery where the line calls for feeling; wrong
-  emphasis; unnatural intonation that doesn't sound like a real person talking.
-- Audio artifacts: clipping, clicks, truncated words, or silence where speech is due.
+### DEFECT CATEGORIES TO REPORT (not exhaustive — report any other genuine defect too)
+- Untranslated / original-language audio: the dub plays SPOKEN speech in the SOURCE
+  language instead of the target — a whole line left undubbed, or original-language audio
+  bleeding through beside or under a line. Listen for a SWITCH OF LANGUAGE, not just
+  wrong words. This is a common, high-priority defect. (Singing is exempt — see above.)
+- Missing / dropped line: a scripted line is not spoken at all — only silence or
+  background where the target-language line should be.
+- Content mismatch: wrong/missing/extra words, gibberish, or non-speech sounds (scream,
+  laugh, noise) where words were expected. Includes STT hallucinations.
+- Text normalization: numbers, times, dates, or acronyms spoken incorrectly.
+- Pronunciation: names or terms mispronounced or given the wrong stress.
+- Timing: audio runs past its subtitle window, is cut off short, or is unnaturally
+  rushed/dragged.
+- Emotion / delivery: tone contradicts the line's intent; robotic, flat, or monotone
+  delivery where the line calls for feeling.
+- Audio artifacts: clipping, clicks, truncated words, or unnatural silence.
 
-Be thorough and honest. It is better to surface a real weakness than to let a mediocre
-line pass. Flag genuine problems across the whole track, not just the worst one or two.
-Do not fabricate defects that aren't there, but do not withhold ones that are — a track
-with several flat or awkward lines should produce several issues, not an empty list.
+### SEVERITY RUBRIC
+- "high": completely ruins the line (missing words, original language spoken instead of
+  the dub, severe glitch, totally wrong emotion).
+- "medium": noticeable errors that distract the listener (slight mispronunciation,
+  awkward timing).
+- "low": minor nitpicks (slightly flat delivery, tiny artifact).
 
-For EACH problem you find, return:
-- "start" and "end": timestamp in seconds of the region in the audio
-- "sub_index": the subtitle index it relates to (or null if none applies)
-- "symptom": concretely what you HEAR that is wrong
-- "mismatch": why it fails relative to the script or to good dubbing quality
-- "severity": "high" | "medium" | "low"
-
-Respond with a strict JSON object: {"issues": [ ... ]}. If the dub is good, return
-{"issues": []}. No other text."""
+### OUTPUT
+Be thorough and honest — do not fabricate defects, but do not withhold real ones. For
+each issue return: "start"/"end" (seconds, as numbers), "sub_index" (integer, or null
+if none applies), "symptom" (concretely what you HEAR), "mismatch" (why it fails vs the
+script or good dubbing), and "severity". Example issue:
+  {"start": 12.5, "end": 15.0, "sub_index": 3,
+   "symptom": "the speaker says 'one two three' instead of 'one hundred twenty three'",
+   "mismatch": "text normalization failure", "severity": "high"}
+If the dub is perfect, return an empty issues array."""
 
 
 class Severity(str, Enum):
@@ -162,19 +170,17 @@ def _retry_call(fn: Callable[[], object], max_attempts: int = 4,
             sleep(base_delay * (2 ** attempt) + jitter())
 
 
-def qc_check(
+def _qc_single_pass(
     audio_bytes: bytes,
     script: str,
     client,
     model: str,
-    passes: int = 3,
     temperature: float = 0.4,
     thinking_level: str = "MEDIUM",
     max_retries: int = 4,
 ) -> list[Issue]:
-    """Run `passes` independent Gemini review passes over the compressed audio +
-    script and return the deduped union of issues. Shared by the CLI and the
-    pipeline's post-COMBINE QC-fix stage."""
+    """One Gemini review pass over one audio slice + its script. Returned issue
+    timestamps are LOCAL to the slice (the caller rebases when chunking)."""
     prompt = (
         "Here is the subtitle script the dub was built from "
         "(format: [index] start-end  Speaker: text):\n\n"
@@ -192,35 +198,96 @@ def qc_check(
         response_mime_type="application/json",
         response_schema=QCReport,
     )
+    r = _retry_call(
+        lambda: client.models.generate_content(
+            model=model, contents=contents, config=gen_config),
+        max_attempts=max_retries)
+    report = r.parsed
+    return report.issues if report else []
 
+
+def _union_survivors(futures, total: int, label: str) -> list[Issue]:
+    """Drain futures, union issues, tolerate partial failures. Only raise if EVERY
+    task failed (so the caller's outer guard ships pass 1 rather than a partial review)."""
+    all_issues: list[Issue] = []
+    errors: list[Exception] = []
+    for f in futures:
+        try:
+            all_issues.extend(f.result())
+        except Exception as e:  # noqa: BLE001 — collect; reraise only if all fail
+            errors.append(e)
+    if errors and len(errors) == total:
+        raise errors[0]
+    if errors:
+        print(f"⚠️  QC: {len(errors)}/{total} {label} failed; "
+              f"using {total - len(errors)} survivor(s)")
+    return dedup_issues(all_issues)
+
+
+def qc_check(
+    audio_bytes: bytes,
+    script: str,
+    client,
+    model: str,
+    passes: int = 3,
+    temperature: float = 0.4,
+    thinking_level: str = "MEDIUM",
+    max_retries: int = 4,
+) -> list[Issue]:
+    """Run `passes` independent Gemini review passes over the whole compressed audio +
+    script and return the deduped union of issues. Recall is a union across passes, so a
+    single pass dying after retries doesn't sink the check — union the survivors."""
     def run_pass(p: int) -> list[Issue]:
-        r = _retry_call(
-            lambda: client.models.generate_content(
-                model=model, contents=contents, config=gen_config),
-            max_attempts=max_retries)
-        report = r.parsed
-        found = report.issues if report else []
+        found = _qc_single_pass(audio_bytes, script, client, model, temperature,
+                                thinking_level, max_retries)
         print(f"pass {p + 1}/{passes}: {len(found)} issue(s)")
         return found
 
-    # QC recall is a union across passes, so a single pass dying (still 503-ing after
-    # retries) shouldn't sink the check — union the survivors. Only raise if every pass
-    # failed, so the caller's outer guard ships pass 1 rather than a partial review.
-    all_issues: list[Issue] = []
-    errors: list[Exception] = []
     with ThreadPoolExecutor(max_workers=passes) as pool:
         futures = [pool.submit(run_pass, p) for p in range(passes)]
-        for f in futures:
-            try:
-                all_issues.extend(f.result())
-            except Exception as e:  # noqa: BLE001 — collect; reraise only if all fail
-                errors.append(e)
-    if errors and len(errors) == passes:
-        raise errors[0]
-    if errors:
-        print(f"⚠️  QC: {len(errors)}/{passes} pass(es) failed; "
-              f"using {passes - len(errors)} survivor(s)")
-    return dedup_issues(all_issues)
+        return _union_survivors(futures, passes, "pass(es)")
+
+
+def qc_check_chunked(
+    seg,
+    subs: list,
+    client,
+    model: str,
+    passes: int = 3,
+    temperature: float = 0.4,
+    thinking_level: str = "MEDIUM",
+    max_retries: int = 4,
+    target_min: float = 10.0,
+    min_split_min: float = 12.0,
+    gap_min_s: float = 2.0,
+) -> list[Issue]:
+    """Chunk long audio (by inter-sub silence) and review it. ALL (chunk x pass) Gemini
+    calls run concurrently; each chunk is sliced to its own 0-based audio + rebased
+    script, so issues come back LOCAL and are rebased by the chunk offset before the
+    union. `seg` is a preloaded mono AudioSegment. Partial failures are tolerated
+    (survivor union); per-call transient errors are retried inside _qc_single_pass."""
+    if not subs:
+        return []
+    chunks = chunk_subs(subs, target_min=target_min, min_split_min=min_split_min,
+                        gap_min_s=gap_min_s)
+    tasks = [(ci, chunk, p) for ci, chunk in enumerate(chunks) for p in range(passes)]
+
+    def run(task):
+        ci, chunk, p = task
+        script = build_chunk_script(chunk)
+        audio_bytes = slice_audio_opus(seg, chunk.offset_s, chunk.end_s)
+        found = _qc_single_pass(audio_bytes, script, client, model, temperature,
+                                thinking_level, max_retries)
+        for it in found:  # rebase local chunk time -> absolute clip time
+            it.start += chunk.offset_s
+            it.end += chunk.offset_s
+        print(f"chunk {ci + 1}/{len(chunks)} pass {p + 1}/{passes}: "
+              f"{len(found)} issue(s)")
+        return found
+
+    with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
+        futures = [pool.submit(run, t) for t in tasks]
+        return _union_survivors(futures, len(tasks), "chunk-pass(es)")
 
 
 def main() -> None:

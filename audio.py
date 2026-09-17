@@ -4,6 +4,7 @@ import boto3
 import srt
 import copy
 import tempfile
+import time
 import soundfile as sf
 import torchaudio
 from modal_utils import run_modal_job
@@ -152,14 +153,23 @@ def split_audio(
     vol = modal.Volume.from_name("dubbing-transfer")
     vol_prefix = f"split_{run_id}"
 
+    _t = time.time()
+    def _lap(label):
+        nonlocal _t
+        dt = time.time() - _t
+        print(f"⏱️  split_audio: {label}={dt:.1f}s")
+        _t = time.time()
+
     input_flac = tempfile.mktemp(suffix=".flac")
     try:
         print(f"[split_audio] Compressing WAV -> FLAC...")
         subprocess.run(["ffmpeg", "-y", "-i", input_audio, input_flac], check=True, capture_output=True)
+        _lap("compress")
 
         print(f"[split_audio] Uploading FLAC to Modal Volume...")
         with vol.batch_upload(force=True) as batch:
             batch.put_file(input_flac, f"{vol_prefix}/input.flac")
+        _lap("upload")
     finally:
         if os.path.exists(input_flac):
             os.remove(input_flac)
@@ -171,6 +181,7 @@ def split_audio(
         poll_delay_sec=5,
         run_id=vol_prefix,
     )
+    _lap("modal_job(boot+decompress+load_model+separate+compress)")
 
     if result["status"] != "COMPLETED":
         raise Exception(f"split_audio failed for {run_id}")
@@ -185,10 +196,12 @@ def split_audio(
         with open(music_flac, "wb") as f:
             for chunk in vol.read_file(f"{vol_prefix}/music.flac"):
                 f.write(chunk)
+        _lap("download")
 
         print(f"[split_audio] Decompressing FLAC -> WAV...")
         subprocess.run(["ffmpeg", "-y", "-i", vocal_flac, output_vocal], check=True, capture_output=True)
         subprocess.run(["ffmpeg", "-y", "-i", music_flac, output_music], check=True, capture_output=True)
+        _lap("decompress")
     finally:
         for f in [vocal_flac, music_flac]:
             if os.path.exists(f):
@@ -199,6 +212,7 @@ def split_audio(
     resample_wav(output_vocal, PIPELINE_SR)
     resample_wav(output_music, PIPELINE_SR)
     prepare_vocal_asr(output_vocal, output_vocal_asr)
+    _lap("resample+asr")
 
 
 
