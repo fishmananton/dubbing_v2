@@ -4,10 +4,10 @@ import boto3
 import srt
 import copy
 import tempfile
-import time
 import soundfile as sf
 import torchaudio
 from modal_utils import run_modal_job
+from parallel import parallel_map
 import os
 import threading
 
@@ -153,23 +153,14 @@ def split_audio(
     vol = modal.Volume.from_name("dubbing-transfer")
     vol_prefix = f"split_{run_id}"
 
-    _t = time.time()
-    def _lap(label):
-        nonlocal _t
-        dt = time.time() - _t
-        print(f"⏱️  split_audio: {label}={dt:.1f}s")
-        _t = time.time()
-
     input_flac = tempfile.mktemp(suffix=".flac")
     try:
         print(f"[split_audio] Compressing WAV -> FLAC...")
         subprocess.run(["ffmpeg", "-y", "-i", input_audio, input_flac], check=True, capture_output=True)
-        _lap("compress")
 
         print(f"[split_audio] Uploading FLAC to Modal Volume...")
         with vol.batch_upload(force=True) as batch:
             batch.put_file(input_flac, f"{vol_prefix}/input.flac")
-        _lap("upload")
     finally:
         if os.path.exists(input_flac):
             os.remove(input_flac)
@@ -181,38 +172,35 @@ def split_audio(
         poll_delay_sec=5,
         run_id=vol_prefix,
     )
-    _lap("modal_job(boot+decompress+load_model+separate+compress)")
 
     if result["status"] != "COMPLETED":
         raise Exception(f"split_audio failed for {run_id}")
 
-    print(f"[split_audio] Downloading results from Modal Volume...")
-    vocal_flac = tempfile.mktemp(suffix=".flac")
-    music_flac = tempfile.mktemp(suffix=".flac")
-    try:
-        with open(vocal_flac, "wb") as f:
-            for chunk in vol.read_file(f"{vol_prefix}/vocal.flac"):
-                f.write(chunk)
-        with open(music_flac, "wb") as f:
-            for chunk in vol.read_file(f"{vol_prefix}/music.flac"):
-                f.write(chunk)
-        _lap("download")
+    print(f"[split_audio] Download + decompress + resample stems (parallel)...")
 
-        print(f"[split_audio] Decompressing FLAC -> WAV...")
-        subprocess.run(["ffmpeg", "-y", "-i", vocal_flac, output_vocal], check=True, capture_output=True)
-        subprocess.run(["ffmpeg", "-y", "-i", music_flac, output_music], check=True, capture_output=True)
-        _lap("decompress")
-    finally:
-        for f in [vocal_flac, music_flac]:
-            if os.path.exists(f):
-                os.remove(f)
+    def _fetch_stem(vol_name: str, out_wav: str, asr_out: str | None):
+        # download one stem's FLAC, decompress to WAV, resample to PIPELINE_SR — identical
+        # per-stem ops as before, just per stem so vocal & music go concurrently. The vocal
+        # stem also builds its 16k ASR copy here, so ASR overlaps the music stem.
+        flac = tempfile.mktemp(suffix=".flac")
+        try:
+            with open(flac, "wb") as f:
+                for chunk in vol.read_file(f"{vol_prefix}/{vol_name}"):
+                    f.write(chunk)
+            subprocess.run(["ffmpeg", "-y", "-i", flac, out_wav],
+                           check=True, capture_output=True)
+            resample_wav(out_wav, PIPELINE_SR)
+            if asr_out:
+                prepare_vocal_asr(out_wav, asr_out)
+        finally:
+            if os.path.exists(flac):
+                os.remove(flac)
+
+    parallel_map(lambda t: _fetch_stem(*t),
+                 [("vocal.flac", output_vocal, output_vocal_asr),
+                  ("music.flac", output_music, None)])
 
     vol.remove_file(vol_prefix, recursive=True)
-
-    resample_wav(output_vocal, PIPELINE_SR)
-    resample_wav(output_music, PIPELINE_SR)
-    prepare_vocal_asr(output_vocal, output_vocal_asr)
-    _lap("resample+asr")
 
 
 
