@@ -32,7 +32,7 @@ from gemini_emotion_extract import extract_emotions_gemini
 from detect_language import detect_language_for_routing
 from voice_profiles import extract_voice_profiles
 from assemblyai_transcribe import assemblyai_transcribe_raw
-from speechmatics_transcribe import speechmatics_transcribe_raw
+from speechmatics_transcribe import speechmatics_transcribe_raw, speechmatics_transcribe_raw_chunked
 from alibabacloud_transcribe import alibaba_transcribe_raw
 from deepgram_transcribe import deepgram_transcribe_raw
 from transcribe_common import assemble_transcription
@@ -137,10 +137,12 @@ def t_diarize(config, audio_file,num_speakers=None, run_id=''):
 
 
 @task(cache_policy=NO_CACHE)
-def t_transcribe_raw(config, audio_file, language, run_id):
+def t_transcribe_raw(config, audio_file, language, run_id, speech_segments=None):
     """Language-routed raw STT. Returns (words_data, trans_language) with ms
     timings for the shared assembler. Engine per language:
-      en -> AssemblyAI, zh -> Alibaba, ja -> Deepgram, else -> Speechmatics."""
+      en -> AssemblyAI, zh -> Alibaba, ja -> Deepgram, else -> Speechmatics.
+    speech_segments (whole-file VAD regions, seconds) let the Speechmatics path
+    split at silence and transcribe chunks concurrently."""
     lang2 = (language or "auto")[:2].lower()
     with timer(f"transcribe_raw[{lang2}]"):
         if lang2 == "en":
@@ -161,6 +163,13 @@ def t_transcribe_raw(config, audio_file, language, run_id):
             return deepgram_transcribe_raw(
                 audio_file_raw=audio_file,
                 deepgram_api_key=config.deepgram_api_key,
+                language=language,
+            )
+        if speech_segments:
+            return speechmatics_transcribe_raw_chunked(
+                audio_file_raw=audio_file,
+                speechmatics_api_key=config.speechmatics_api_key,
+                speech_segments=speech_segments,
                 language=language,
             )
         return speechmatics_transcribe_raw(
@@ -478,8 +487,8 @@ def t_generate_videos(config, video_file, audio_result_file, preview=True):
 def t_detect_language(config, speaker_segments, audio = None):
     with timer("Detect Language"):
         audio = audio if audio else config.vocal_file
-        lang = detect_language_for_routing(audio, speaker_segments)
-        return lang
+        lang, speech_segments = detect_language_for_routing(audio, speaker_segments)
+        return lang, speech_segments
 
 @task
 def t_loudness_adjust(subtitles_file, vocal_file,tts_segments_folder):
@@ -732,13 +741,14 @@ def dubbing_flow(
         # Start diarization in parallel
         diar_fut = t_diarize.submit(config, vocal_asr_file, num_speakers, run_id)
 
-        initial_language = initial_language_fut.result()
+        initial_language, speech_segments = initial_language_fut.result()
         path = Path(config.general_config_file)
         data = json.loads(path.read_text()) if path.exists() else {}
         data["initial_src_language"] = initial_language
         path.write_text(json.dumps(data, indent=4))
     else:
         diar_fut = None
+        speech_segments = None
         speakers_segments = json.loads(Path(config.speakers_segments_file).read_text())
         initial_language = json.loads(Path(config.general_config_file).read_text())["initial_src_language"]
 
@@ -762,7 +772,7 @@ def dubbing_flow(
             else:
                 asr_input = audio_file
 
-            raw_fut = t_transcribe_raw.submit(config, asr_input, initial_language, run_id)
+            raw_fut = t_transcribe_raw.submit(config, asr_input, initial_language, run_id, speech_segments)
 
             if diar_fut is not None:
                 speakers_segments = diar_fut.result()
@@ -799,8 +809,9 @@ def dubbing_flow(
         mouth_windows_fut = t_detect_mouth_windows.submit(video_file, config.subtitles)
         detect_songs_fut = t_detect_songs.submit(config, config.audio_file,
                                                  config.subtitles)
-        if ttsmodel == TTS_MODEL.INDEXTTS2.value:
-            prewarm_handles, prewarm_pods = prewarm_indextts2(config.subtitles)
+        #prewarm commented
+        # if ttsmodel == TTS_MODEL.INDEXTTS2.value:
+        #     prewarm_handles, prewarm_pods = prewarm_indextts2(config.subtitles)
 
     # Resolve detect_gender early so translate can start in parallel with Gemini
     if detect_gender_fut:
@@ -1264,4 +1275,4 @@ if __name__ == "__main__":
                  # test_duration_sec=120,
                  is_dubbed=False,
                  use_non_speech=True,
-                 stage = STAGES.SPLIT.value)
+                 stage = STAGES.EMOTION.value)

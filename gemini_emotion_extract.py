@@ -158,11 +158,18 @@ def _call_gemini(client: genai.Client, model_name: str, audio_bytes: bytes, cont
         for attempt in range(max_retries):
             try:
                 return _call_gemini_once(client, model, audio_bytes, context)
-            except genai.errors.ServerError:
+            except (genai.errors.ServerError, genai.errors.ClientError) as e:
+                # Retry transient server errors (5xx) and rate limits (429); fail
+                # fast on real client errors (bad request/auth). Rate limits matter
+                # now that we fan out one call per batch concurrently.
+                is_rate_limit = getattr(e, "code", None) == 429
+                if not (isinstance(e, genai.errors.ServerError) or is_rate_limit):
+                    raise
                 if attempt == max_retries - 1:
                     break
                 wait = 2 ** attempt + 1
-                print(f"  Gemini {model} server error, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                reason = "rate limit" if is_rate_limit else "server error"
+                print(f"  Gemini {model} {reason}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(wait)
         print(f"  Gemini {model} failed after {max_retries} attempts, trying next model...")
 
@@ -206,7 +213,10 @@ def extract_emotions_gemini(
         audio_bytes = _encode_ogg(audio_data, sr, start, end)
         return _call_gemini(client, gemini_model_name, audio_bytes, context)
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    # One call per batch, fanned out so all batches run in a single wave (bounded).
+    # Batches are independent and merged by idx below, so this only changes speed.
+    max_workers = max(1, min(len(batches), int(os.environ.get("EMOTION_MAX_WORKERS", "16"))))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_process_batch, s, e, ctx) for s, e, ctx in batches]
         for future in as_completed(futures):
             all_results.extend(future.result())

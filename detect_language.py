@@ -21,17 +21,20 @@ def _get_speech_segments_via_vad(audio_path: str) -> list[dict]:
     return [{"start": ts["start"] / sr, "end": ts["end"] / sr} for ts in timestamps]
 
 
-def detect_language_for_routing(audio_path: str, speaker_segments: list | None = None, zh_threshold: float = 0.40) -> str:
+def detect_language_for_routing(audio_path: str, speaker_segments: list | None = None, zh_threshold: float = 0.40) -> tuple[str, list[dict]]:
     """
     Stitches speech segments into a 30s pure speech buffer.
-    Returns 'zh' if Chinese is detected (for Alibaba), otherwise 'auto' (for AssemblyAI).
+    Returns (language, speech_segments): 'zh' if Chinese is detected (for Alibaba),
+    otherwise the top language. speech_segments are the whole-file speech regions
+    (Silero VAD, seconds) — reused downstream to pick silence-aligned split points
+    for parallel transcription, so the VAD is computed only once.
     If speaker_segments is None, uses Silero VAD to find speech regions.
     """
     if speaker_segments is None:
         speaker_segments = _get_speech_segments_via_vad(audio_path)
 
     if not speaker_segments:
-        return "auto"
+        return "auto", []
 
     # 1. Load raw audio tensor
     audio = whisper.load_audio(audio_path)
@@ -57,7 +60,7 @@ def detect_language_for_routing(audio_path: str, speaker_segments: list | None =
             break
 
     if not speech_chunks:
-        return "auto"
+        return "auto", speaker_segments
 
     # 3. Concatenate all speech chunks in RAM & cap at 30 seconds
     pure_speech = np.concatenate(speech_chunks)[:target_samples]
@@ -70,7 +73,7 @@ def detect_language_for_routing(audio_path: str, speaker_segments: list | None =
 
     # 5. Routing logic
     if probs.get("zh", 0.0) >= zh_threshold:
-        return "zh"
+        return "zh", speaker_segments
     initial_language = max(probs, key=probs.get)
 
-    return initial_language
+    return initial_language, speaker_segments
